@@ -1,0 +1,9 @@
+# 依赖与权重不进仓库（Release 附件 / Setup 自动下载）
+weights/
+wheels/
+.venv/
+__pycache__/
+*.pyc
+
+# 真实密钥配置绝不入库
+api_settings.json
