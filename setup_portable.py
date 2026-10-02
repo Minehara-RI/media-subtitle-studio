@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
+import posixpath
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -44,7 +48,44 @@ REQUIRED_PACKAGES = [
     "requests",
 ]
 
-# Whisper 官方权重文件名 → 字节数下限（用来识别“占位/残缺文件”）
+_WHISPER_BASE = "https://openaipublic.azureedge.net/main/whisper/models/"
+WHISPER_MODEL_DIR_ENV = "WHISPER_MODEL_DIR"
+
+# Whisper 官方模型表：名称 → {url, sha256, size}。
+# url 末段目录即官方 SHA-256（出处：openai/whisper 的 whisper/__init__.py _MODELS）。
+# size 为官方字节数，用于「已下满就直接校验、不重复下载」。
+WHISPER_MODELS: dict[str, dict[str, object]] = {
+    "tiny.en.pt": {
+        "url": _WHISPER_BASE + "d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt",
+        "sha256": "d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03",
+        "size": 75_571_315,
+    },
+    "base.pt": {
+        "url": _WHISPER_BASE + "ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
+        "sha256": "ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e",
+        "size": 145_262_807,
+    },
+    "small.pt": {
+        "url": _WHISPER_BASE + "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
+        "sha256": "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794",
+        "size": 483_617_219,
+    },
+    "medium.pt": {
+        "url": _WHISPER_BASE + "345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
+        "sha256": "345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1",
+        "size": 1_528_008_539,
+    },
+    "large-v3.pt": {
+        "url": _WHISPER_BASE + "e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt",
+        "sha256": "e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb",
+        "size": 3_087_371_615,
+    },
+}
+
+# 识别权重用文件名 → 字节数下限（用来识别「占位 / 残缺文件」）。
+# 注意：这里刻意用「下限」而不是精确字节数，这样旧版本 / 略微不同的同名权重
+# 也能被认出来，不会被误判成残缺而重下 1.5 GB。
+# 下载时用的精确字节数在 WHISPER_MODELS[name]["size"] 里（用于断点续传判断）。
 WHISPER_WEIGHTS = {
     "tiny.en.pt": 70_000_000,
     "base.pt": 140_000_000,
@@ -52,7 +93,13 @@ WHISPER_WEIGHTS = {
     "medium.pt": 1_400_000_000,
     "large-v3.pt": 2_800_000_000,
 }
-WHISPER_MODEL_DIR_ENV = "WHISPER_MODEL_DIR"
+
+# 下载权重时优先使用的模型名（轻量包默认不带权重，首次配置按这个顺序挑一个直链下载）。
+PREFERRED_DOWNLOAD_ORDER = ("medium.pt", "small.pt", "base.pt", "tiny.en.pt")
+WEIGHT_MIRROR_ENV = "MSS_WEIGHT_MIRROR"
+WEIGHT_MIRROR = os.environ.get(WEIGHT_MIRROR_ENV, "").strip()
+WEIGHT_DOWNLOAD_TIMEOUT = 60
+WEIGHT_DOWNLOAD_TRIES = 3
 
 
 def configure_stdio() -> None:
@@ -296,6 +343,212 @@ def weights_ready_for_check() -> bool:
     return any(name in names for name in WEIGHTS_REQUIRED_FOR_CHECK)
 
 
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def human_size(num_bytes: float) -> str:
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f} GB"
+    return f"{num_bytes / 1_048_576:,.0f} MB"
+
+
+def candidate_weight_urls(name: str) -> list[str]:
+    """官方直链在前，镜像（MSS_WEIGHT_MIRROR / --weight-mirror）在后，去重保序。"""
+    spec = WHISPER_MODELS.get(name)
+    if not spec:
+        return []
+    urls = [str(spec["url"])]
+    if WEIGHT_MIRROR:
+        urls.append(WEIGHT_MIRROR.rstrip("/") + "/" + posixpath.basename(str(spec["url"])))
+    seen: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def _retry_wait(attempt: int, attempts: int, exc: Exception) -> None:
+    warn(f"连接失败（第 {attempt}/{attempts} 次）：{exc}；3 秒后重试…")
+    time.sleep(3)
+
+
+def _open_with_retry(url: str, offset: int, attempts: int = WEIGHT_DOWNLOAD_TRIES):
+    """打开 url；offset > 0 时用 Range 续传。返回 (响应, 状态码, 实际起点的 offset)。
+
+    - 起点失效（416）或服务器不支持 Range（非 206）时，自动退回从 0 重下，不消耗重试次数；
+    - 网络错误才消耗重试次数，用满 attempts 次后抛出。
+    """
+    last_error: Exception | None = None
+    used = 0
+    while used < attempts:
+        used += 1
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "MediaSubtitleStudio-Setup/1.0"})
+        if offset > 0:
+            request.add_header("Range", f"bytes={offset}-")
+        try:
+            response = urllib.request.urlopen(request, timeout=WEIGHT_DOWNLOAD_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if offset > 0 and exc.code == 416:
+                # 起点超出文件长度：多半是本地 .part 已经下满，从头再来一次。
+                exc.close()
+                offset = 0
+                used -= 1
+                continue
+            last_error = exc
+            if used < attempts:
+                _retry_wait(used, attempts, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 逐个重试，最后统一报错
+            last_error = exc
+            if used < attempts:
+                _retry_wait(used, attempts, exc)
+            continue
+        status = getattr(response, "status", 200) or 200
+        if offset > 0 and status != 206:
+            # 服务器不支持断点续传：只能从 0 重来。
+            response.close()
+            warn("服务器不支持断点续传，从头上重新下载…")
+            offset = 0
+            used -= 1
+            continue
+        return response, status, offset
+    raise RuntimeError(f"无法连接：{last_error}")
+
+
+def fetch_weight(name: str, target_dir: Path) -> bool:
+    """下载单个权重：支持断点续传 + SHA-256 校验 + 镜像回退。成功返回 True。
+
+    完成判定以服务器给的 Content-Length 为准（.part 累计字节数），
+    这样即使本地预置的 size 有细微出入也不会把下满的文件误判成中断。
+    """
+    spec = WHISPER_MODELS.get(name)
+    if not spec:
+        fail(f"没有 {name} 的官方直链，请手动放入 {target_dir}")
+        return False
+    expected_hash = str(spec["sha256"])
+    expected_size = int(spec["size"])
+    destination = target_dir / name
+    partial = target_dir / (name + ".part")
+
+    if destination.is_file() and destination.stat().st_size == expected_size:
+        info(f"{name} 已存在，校验 SHA-256…")
+        if sha256_of(destination) == expected_hash:
+            ok(f"{name} 校验通过，跳过下载。")
+            return True
+        warn(f"{name} 已存在但校验不符，重新下载。")
+        destination.unlink()
+    elif partial.is_file() and partial.stat().st_size > expected_size:
+        partial.unlink()
+
+    for url in candidate_weight_urls(name):
+        info(f"下载 {name}（{human_size(expected_size)}）…")
+        info(f"  源：{url}")
+        try:
+            total = expected_size
+            done = False
+            for attempt in range(1, WEIGHT_DOWNLOAD_TRIES + 1):
+                offset = partial.stat().st_size if partial.is_file() else 0
+                if offset >= total:
+                    # 已下满，只是还没改名 / 校验（例如上次正好下完就被打断）。
+                    done = True
+                    break
+                response, _status, offset = _open_with_retry(url, offset)
+                header = response.headers.get("Content-Length")
+                if offset > 0:
+                    info(f"  断点续传：从 {human_size(offset)} 继续（第 {attempt}/{WEIGHT_DOWNLOAD_TRIES} 次）。")
+                else:
+                    info(f"  开始下载（第 {attempt}/{WEIGHT_DOWNLOAD_TRIES} 次）。")
+                if header and str(header).isdigit():
+                    total = int(header) + offset
+                written = offset
+                started = time.time()
+                last_report = started
+                with response, open(partial, "ab" if offset else "wb") as output:
+                    while True:
+                        block = response.read(1024 * 512)
+                        if not block:
+                            break
+                        output.write(block)
+                        written += len(block)
+                        now = time.time()
+                        if now - last_report >= 2.0:
+                            last_report = now
+                            elapsed = max(now - started, 1e-6)
+                            speed = (written - offset) / elapsed / 1_048_576
+                            percent = min(written / total * 100, 100) if total else 0.0
+                            sys.stdout.write(
+                                f"\r      {percent:5.1f}%  {human_size(written)} / "
+                                f"{human_size(total)}  {speed:6.1f} MB/s   ")
+                            sys.stdout.flush()
+                sys.stdout.write("\r" + " " * 78 + "\r")
+                if written >= total:
+                    done = True
+                    break
+                warn(f"  连接中断（已收 {human_size(written)} / {human_size(total)}），准备续传…")
+            if not done:
+                warn(f"{name} 多次中断，换下一个源…")
+                continue
+            info(f"  校验 {name} 的 SHA-256…")
+            actual_hash = sha256_of(partial)
+            if actual_hash != expected_hash:
+                fail(f"  校验失败：期望 {expected_hash[:12]}…，实际 {actual_hash[:12]}…")
+                partial.unlink()
+                warn(f"{name} 校验不通过，换下一个源…")
+                continue
+            partial.replace(destination)
+            ok(f"已下载并校验通过：{name} → {destination}")
+            return True
+        except Exception as exc:  # noqa: BLE001 - 一个源失败就换下一个
+            warn(f"  该源失败：{exc}")
+            continue
+
+    fail(f"{name} 所有下载源都失败了。")
+    print(f"      可手动下载后放进 {target_dir}")
+    print(f"      官方地址：{WHISPER_MODELS[name]['url']}")
+    if partial.is_file():
+        print(colorize(f"      已保留未完成的文件 {partial.name}，下次重跑会自动续传。", "dim"))
+    return False
+
+
+def download_missing_weights(names: list[str] | None = None) -> bool:
+    """下载缺失权重到缓存目录。支持断点续传、SHA-256 校验、镜像回退。
+
+    names 为空时：优先下载 medium.pt（便携轻量包的默认大模型），
+    已就绪就跳过；一个都没下成时才退到 small / base / tiny.en。
+    """
+    _ready, missing = weights_status()
+    missing_names = {str(item) for item in missing if isinstance(item, str)}
+
+    if names is None:
+        # 只补缺失的：medium 优先，没有就退到更小的模型，避免白下 1.46 GB。
+        names = [name for name in PREFERRED_DOWNLOAD_ORDER if name in missing_names]
+
+    target = whisper_cache_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    info(f"权重缓存目录：{target}")
+
+    downloaded = False
+    for name in names:
+        # 点名的权重直接走 fetch_weight（内部会校验，一致就跳过）。
+        if fetch_weight(name, target):
+            downloaded = True
+
+    _ready, still = weights_status()
+    ok_names = {path.name for path in _ready if isinstance(path, Path)}
+    if ok_names & set(WEIGHTS_REQUIRED_FOR_CHECK):
+        return True
+    if downloaded:
+        return True
+    warn(f"仍未就绪（缺失：{', '.join(str(item) for item in still)}）。")
+    return False
+
+
 def install_weights(auto: bool) -> bool:
     ready, missing = weights_status()
     for path in ready:
@@ -324,50 +577,21 @@ def install_weights(auto: bool) -> bool:
         if not missing:
             return True
     names = ", ".join(str(item) for item in missing if isinstance(item, str))
-    warn(f"便携包里没有找到权重文件（{names}）。")
+    info(f"便携包里未附带权重（{names}）——轻量包默认不带，首次配置时按需下载。")
     print("      两种选择：")
-    print("      ① 现在联网由 Whisper 自动下载（识别第一次运行时进行，速度取决于网络）；")
-    print("      ② 手动把 .pt 权重放进 " + str(whisper_cache_dir()) + "。")
-    if have_internet():
-        try:
-            answer = input("      现在就下载缺失的权重吗？[y/N] ").strip().lower()
-        except EOFError:
-            answer = "n"
-        if answer == "y":
-            return download_missing_weights()
-    warn("跳过权重下载（不阻塞后续配置）。")
-    return True
-
-
-def download_missing_weights() -> bool:
-    """按 Whisper 官方约定直接下载权重到缓存目录。"""
-    _ready, missing = weights_status()
-    base = "https://openaipublic.azureedge.net/main/whisper/models/"
-    hashes = {
-        "tiny.en.pt": "d3c57d4a2d0b4fbaf0a8603ee9d4adafefcee3f8b3b19cbe2b0a1d0f0b3d0e7d",
-        "base.pt": "25a8566e1d0c1e2231d1c762132cd18e7f967960e30d59d4588b2bd3d0704ed4",
-        "small.pt": "973614041a8a0b0ebebe6b3ea0e4cbb88e57bb4242a0d6c8e2a7c0e2c0c0a0b0",
-    }
-    # 哈希表仅覆盖部分模型：medium / large-v3 体积过大且官方 URL 含完整哈希，
-    # 直接让 whisper 库在首次使用时自行下载更可靠。
-    downloadable = {name: base + digest + ".pt" for name, digest in hashes.items()
-                    if name in missing}
-    if not downloadable:
-        warn("缺失的权重没有预置直链，将在首次识别时由 Whisper 自动下载。")
+    print("      ① 现在下载（推荐；支持断点续传，中断后重跑 Setup.bat 会自动续传）；")
+    print("      ② 跳过，稍后把 .pt 权重放进 " + str(whisper_cache_dir()) + "。")
+    if not have_internet():
+        warn("当前没有网络，跳过权重下载。")
         return True
-    target = whisper_cache_dir()
-    target.mkdir(parents=True, exist_ok=True)
-    for name, url in downloadable.items():
-        info(f"下载 {name} …")
-        try:
-            with urllib.request.urlopen(url, timeout=60) as response, \
-                    open(target / name, "wb") as output:
-                shutil.copyfileobj(response, output)
-            ok(f"已下载 {name}")
-        except Exception as exc:  # noqa: BLE001 - 下载失败不阻塞
-            warn(f"{name} 下载失败（{exc}）；首次识别时 Whisper 会重试。")
-    _ready, still = weights_status()
-    return not still
+    try:
+        answer = input("      现在就下载权重吗？[Y/n] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer in ("", "y", "yes"):
+        return download_missing_weights()
+    warn("已跳过权重下载；下载好权重后重跑 Setup.bat 即可。")
+    return True
 
 
 def collect_weights() -> int:
@@ -596,9 +820,17 @@ def main(argv=None) -> int:
     parser.add_argument("--check", action="store_true", help="只体检，不改动")
     parser.add_argument("--collect-weights", action="store_true",
                         help="把本机已缓存的 Whisper 权重复制进 weights\\ 目录（打包用）")
+    parser.add_argument("--download-weights", metavar="模型名", nargs="?", const="auto",
+                        help="只下载权重（默认 medium.pt；也可 tiny.en / base / small / medium / large-v3）")
+    parser.add_argument("--weight-mirror", metavar="地址",
+                        help="权重镜像地址（默认官方 CDN；如 https://hf-mirror.com 等自建镜像）")
     parser.add_argument("--offline", action="store_true",
                         help="只用便携包内的 wheels 离线安装")
     args = parser.parse_args(argv)
+
+    global WEIGHT_MIRROR
+    if args.weight_mirror:
+        WEIGHT_MIRROR = args.weight_mirror.strip()
 
     print(colorize(f"==== {APP_NAME} 便携包配置 ====", "bold"))
     print(colorize(f"目录：{script_dir()}", "dim"))
@@ -608,12 +840,27 @@ def main(argv=None) -> int:
         if problems:
             for item in problems:
                 fail(item)
+            if not args.no_whisper and not weights_ready_for_check() and have_internet():
+                print(colorize("    提示：加 --download-weights 可以现在就下载权重（支持断点续传）。", "dim"))
             return 1
         ok("体检通过：依赖 / 权重 / API 配置 / ffmpeg 全部就绪。")
         return 0
 
     if args.collect_weights:
         return collect_weights()
+
+    if args.download_weights:
+        alias = args.download_weights
+        if alias == "auto":
+            names = None
+        else:
+            names = [alias if alias.endswith(".pt") else alias + ".pt"]
+            unknown = [name for name in names if name not in WHISPER_MODELS]
+            if unknown:
+                fail(f"未知权重名：{', '.join(unknown)}；"
+                     f"可选：{', '.join(WHISPER_MODELS)}")
+                return 1
+        return 0 if download_missing_weights(names) else 1
 
     if not ensure_venv(offline_wheels=args.offline):
         return 1
