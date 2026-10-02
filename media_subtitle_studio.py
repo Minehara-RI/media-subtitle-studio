@@ -201,9 +201,9 @@ def get_config_path() -> Path:
 
 
 def _valid_model(model) -> bool:
-    return (isinstance(model, dict)
-            and model.get("name") and model.get("url")
-            and model.get("api_key") and model.get("model"))
+    return bool(isinstance(model, dict)
+                and model.get("name") and model.get("url")
+                and model.get("api_key") and model.get("model"))
 
 
 def load_config():
@@ -794,6 +794,8 @@ def _chat_completion(model_cfg, system_prompt, user_content, max_tokens):
             last_err = RuntimeError(f"网络错误: {e}")
         if attempt < TRANSLATION_RETRIES:
             time.sleep(1.0 * (attempt + 1))
+    if last_err is None:                       # 正常流程到不了这里；兜底并收窄类型
+        last_err = RuntimeError("翻译请求失败")
     raise last_err
 
 
@@ -1102,8 +1104,11 @@ def configure_stdio() -> None:
     非 GBK 字符会直接抛 UnicodeEncodeError 把命令搞挂。
     """
     for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:                # pythonw / 被重定向的流可能没有这个方法
+            continue
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, OSError, ValueError):
             continue
 
@@ -2080,9 +2085,10 @@ def normalize_export_tracks(mux_tracks) -> list[dict]:
         else:
             kind, mode = "generated", (mode or "原文")
             language, title = normalise_language_tag(item.get("language")), item.get("title")
+        bind = item.get("bind")
         tracks.append({"kind": kind, "mode": mode, "path": path,
                        "language": language, "title": title,
-                       "bind": dict(item.get("bind") or {})})
+                       "bind": dict(bind) if isinstance(bind, dict) else {}})
     return tracks
 
 
@@ -2211,6 +2217,8 @@ def resolve_export_tracks(media, tracks, *, log=None) -> tuple[list[dict], list[
                             "path": str(path) if path is not None else None})
             if log:
                 log(f"跳过字幕轨：字幕文件不存在（{path}）")
+            continue
+        if path is None:                    # 上面已处理 None；显式判断，供类型检查收窄
             continue
         track["path"] = path
         if not track.get("title"):
@@ -2639,7 +2647,7 @@ def ai_semantic_duplicate(candidate, existing, model_name=None, cancel_event=Non
     return {"verdict": verdict, "tokens": tokens, "error": error}
 
 
-def compare_subtitles(candidate, existing, *, threshold=DUPLICATE_THRESHOLD_DEFAULT,
+def compare_subtitles(candidate, existing, *, threshold: float = DUPLICATE_THRESHOLD_DEFAULT,
                       use_ai: bool = True, model_name=None, cancel_event=None,
                       label: str = "") -> dict:
     """两份字幕是否算重复：**同一种语言**且内容雷同才算。
@@ -3020,9 +3028,10 @@ def prepare_plan_source(media, steps, options=None, *, log=None, cancel_event=No
 
     info = probe_media(media)
     audio, _embedded, _videos = probe_tracks(info)
-    wanted = int(settings.get("audio_ordinal")
-                 if settings.get("audio_ordinal") is not None
-                 else options.get("audio_ordinal") or 0)
+    wanted_value = settings.get("audio_ordinal")
+    if wanted_value is None:
+        wanted_value = options.get("audio_ordinal") or 0
+    wanted = int(wanted_value or 0)
     ordinal = max(0, min(wanted, len(audio) - 1)) if audio else None
     track_missing = ordinal is None or ordinal != wanted
     source_mode = str(options.get("translate_source") or TRANSLATE_SOURCE_ASR)
@@ -3039,18 +3048,22 @@ def prepare_plan_source(media, steps, options=None, *, log=None, cancel_event=No
         if log:
             log(f"步骤 {asr_order}/{len(steps)} · {asr_label}" if asr_order
                 else f"自动识别音轨 {ordinal + 1}（计划里没有识别步骤）")
+        def forward_progress(text):
+            if log is not None:
+                log(text)
+
         report("begin")
         with tempfile.TemporaryDirectory(prefix="plan_asr_") as temp_dir:
             wav = Path(temp_dir) / "audio.wav"
             audio_to_wav(media, ordinal, wav)
             recognized = transcribe_audio(wav, model, language,
-                                          progress=(lambda text: log(text)) if log else None,
+                                          progress=forward_progress if log else None,
                                           label="计划识别")
         report("done")
         result.update(entries=recognized, original=copy.deepcopy(recognized), note=note)
         return result
 
-    if asr_steps and not track_missing:
+    if asr_steps and ordinal is not None and not track_missing:
         return full_recognition(f"完整识别音轨 {ordinal + 1}")
     if asr_steps and log:
         log(f"选不到第 {wanted + 1} 条音轨（该文件只有 {len(audio)} 条），改用自动兜底")
@@ -3137,12 +3150,24 @@ def run_plan_for_files(files, steps, *, log=None, progress=None, cancel_event=No
     ready = {index: threading.Event() for index in range(1, len(file_list) + 1)}
 
     def file_log(path):
-        return (lambda text: log(text, path.name)) if log else None
+        if log is None:
+            return None
+
+        def forward(text):
+            if log is not None:
+                log(text, path.name)
+
+        return forward
 
     def file_step(path, index):
         if not step_callback:
             return None
-        return lambda event: step_callback(event, index, path)
+
+        def forward(event):
+            if step_callback:
+                step_callback(event, index, path)
+
+        return forward
 
     def recognition_worker():
         for index, path in enumerate(file_list, 1):
@@ -4088,11 +4113,15 @@ def create_audio_clock(media_path, ffmpeg: str | None, audio_ordinal: int = 0):
     audio_ordinal 为音频流序号（0 起），用于让播放跟随界面所选的音轨。
     """
     ordinal = max(0, int(audio_ordinal or 0))
-    for factory, argument in ((MpvAudioClock.create, None),
-                              (WaveOutAudioClock.create, ffmpeg)):
+    try:
+        clock = MpvAudioClock.create(media_path, ordinal)
+    except Exception:
+        clock = None
+    if clock is not None:
+        return clock
+    if ffmpeg:
         try:
-            clock = (factory(media_path, ordinal) if argument is None
-                     else factory(argument, media_path, ordinal))
+            clock = WaveOutAudioClock.create(ffmpeg, media_path, ordinal)
         except Exception:
             clock = None
         if clock is not None:
@@ -5939,6 +5968,9 @@ class SubtitleStudio:
 
     def _draw_caption_block(self, image, draw, width: int, height: int, block: dict,
                             default_size: int, bottom_limit: float) -> float:
+        pil_image, pil_draw = Image, ImageDraw
+        if pil_image is None or pil_draw is None:   # 防御性检查（调用方已拦截）+ 类型收窄
+            return bottom_limit
         res_x = int(block.get("res_x") or 0)
         res_y = int(block.get("res_y") or 0)
         scale_y = (height / res_y) if res_y else 1.0
@@ -6006,7 +6038,7 @@ class SubtitleStudio:
                 (x - pad_x, y - pad_y, x + block_width + pad_x, y + block_height + pad_y),
                 radius=self.px(5), fill=(0, 0, 0, 128))
         line_y = y
-        affine = getattr(Image, "AFFINE", 0)
+        affine = getattr(pil_image, "AFFINE", 0)
         for item in prepared:
             if item is None:
                 line_y += spacing
@@ -6017,17 +6049,17 @@ class SubtitleStudio:
                 fill = tuple(run.get("colour") or primary) + (255,)
                 if run.get("italic"):
                     pad = self.px(8)
-                    layer = Image.new("RGBA",
-                                      (int(run_width) + pad * 2,
-                                       int(line_height) + pad * 2), (0, 0, 0, 0))
-                    ImageDraw.Draw(layer).text((pad, pad), run["text"], font=font,
-                                               fill=fill, stroke_width=stroke,
-                                               stroke_fill=outline + (255,))
+                    layer = pil_image.new("RGBA",
+                                          (int(run_width) + pad * 2,
+                                           int(line_height) + pad * 2), (0, 0, 0, 0))
+                    pil_draw.Draw(layer).text((pad, pad), run["text"], font=font,
+                                              fill=fill, stroke_width=stroke,
+                                              stroke_fill=outline + (255,))
                     shear = 0.22
                     shifted = int(layer.height * shear)
                     layer = layer.transform((layer.width + shifted, layer.height),
                                             affine, (1, shear, -shifted, 0, 1, 0),
-                                            resample=Image.BILINEAR)
+                                            resample=pil_image.BILINEAR)
                     image.alpha_composite(layer, (int(run_x) - pad, int(line_y) - pad))
                 else:
                     draw.text((run_x, line_y), run["text"], font=font, fill=fill,
