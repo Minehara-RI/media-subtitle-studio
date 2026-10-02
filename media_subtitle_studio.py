@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 try:
     _tkinterdnd2 = importlib.import_module("tkinterdnd2")
@@ -66,6 +66,7 @@ MEDIA_EXTENSIONS = {
 }
 SUBTITLE_EXTENSIONS = {".ass", ".smi", ".srt", ".ssa", ".sub", ".vtt"}
 SUBTITLE_IMPORT_ENTRY = "导入外部字幕文件…"
+CUSTOM_LANGUAGE_ENTRY = "自定义语言…"
 # 「输出 / 压制的字幕」列表里可选的条目（可同时选多条 → 多条字幕轨）
 MUX_TRACK_ORIGINAL = "生成 · 原文"
 MUX_TRACK_TRANSLATED = "生成 · 译文"
@@ -143,19 +144,25 @@ FONT_PATHS = (
     r"C:\Windows\Fonts\arial.ttf",
 )
 PALETTE = {
-    "bg": "#eef2ef",
-    "surface": "#ffffff",
-    "surface_alt": "#f5f9f6",
-    "border": "#d9e2db",
-    "ink": "#1d2c26",
-    "muted": "#68786f",
-    "accent": "#0b7d5b",
-    "accent_hover": "#096a4d",
-    "accent_soft": "#dff0e8",
-    "drop_idle": "#e3efe8",
-    "drop_hover": "#cae4d5",
-    "preview": "#0e1512",
-    "preview_text": "#d6e4dc",
+    "bg": "#0b1220",
+    "surface": "#111c2e",
+    "surface_alt": "#17263d",
+    "border": "#2d4d73",
+    "ink": "#ebf3ff",
+    "muted": "#a7bcdb",
+    "accent": "#4a90ff",
+    "accent_hover": "#2f73eb",
+    "accent_soft": "#1a3d68",
+    "drop_idle": "#12233a",
+    "drop_hover": "#18365d",
+    "drop_text": "#dfeeff",
+    "preview_stage": "#0d1727",
+    "preview": "#060c14",
+    "preview_text": "#dfe9ff",
+    "disabled": "#6d7d99",
+    "done": "#123c5b",
+    "failed": "#4b2d3a",
+    "skipped": "#473b1f",
 }
 UI_FONT_STACK = ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Tahoma")
 LOG_FONT_STACK = ("Cascadia Mono", "Consolas", "Courier New")
@@ -4156,6 +4163,9 @@ class SubtitleStudio:
         self.position_var = tk.DoubleVar(value=0.0)
         self.source_var = tk.StringVar(value="自动检测")
         self.target_var = tk.StringVar(value="中文（简体）")
+        self.custom_translation_languages: list[str] = []
+        self._source_language_previous = self.source_var.get()
+        self._target_language_previous = self.target_var.get()
         self.asr_language_var = tk.StringVar(value="自动检测")
         self.whisper_model_var = tk.StringVar(value=default_whisper_model())
         self.translation_model_var = tk.StringVar(value=default_translation_model())
@@ -4287,8 +4297,9 @@ class SubtitleStudio:
         p = self.px
         style = self.style
         style.configure("TFrame", background=PALETTE["bg"])
-        style.configure("Header.TFrame", background=PALETTE["bg"])
+        style.configure("Header.TFrame", background=PALETTE["surface"])
         style.configure("Panel.TFrame", background=PALETTE["surface"])
+        style.configure("PreviewStage.TFrame", background=PALETTE["preview_stage"])
         style.configure("TLabel", background=PALETTE["bg"], foreground=PALETTE["ink"],
                         font=self.fonts["base"])
         style.configure("Surface.TLabel", background=PALETTE["surface"],
@@ -4301,39 +4312,91 @@ class SubtitleStudio:
                         font=self.fonts["title"])
         style.configure("Subtitle.TLabel", background=PALETTE["bg"],
                         foreground=PALETTE["muted"], font=self.fonts["small"])
+        style.configure("HeaderTitle.TLabel", background=PALETTE["surface"],
+                foreground=PALETTE["ink"], font=self.fonts["title"])
+        style.configure("HeaderSubtitle.TLabel", background=PALETTE["surface"],
+                foreground=PALETTE["muted"], font=self.fonts["small"])
         style.configure("Section.TLabel", background=PALETTE["surface"],
                         foreground=PALETTE["ink"], font=self.fonts["section"])
-        style.configure("TButton", font=self.fonts["button"], padding=(p(12), p(6)))
-        style.configure("Accent.TButton", font=self.fonts["button"], padding=(p(14), p(7)),
-                        background=PALETTE["accent"], foreground="#ffffff",
-                        borderwidth=0, focuscolor=PALETTE["accent"])
-        style.map("Accent.TButton",
-                  background=[("disabled", "#9dbfb1"), ("pressed", PALETTE["accent_hover"]),
-                              ("active", PALETTE["accent_hover"])],
-                  foreground=[("disabled", "#f2f7f4")])
-        style.configure("Ghost.TButton", font=self.fonts["small"], padding=(p(8), p(3)))
-        style.configure("TCombobox", padding=p(4))
-        style.configure("TSpinbox", padding=p(3), arrowsize=p(12), font=self.fonts["base"])
+        style.configure("TButton", font=self.fonts["button"], padding=(p(12), p(6)),
+                background=PALETTE["surface_alt"], foreground=PALETTE["ink"])
+        style.map("TButton", background=[("disabled", PALETTE["surface"]),
+                          ("pressed", PALETTE["accent_soft"]),
+                          ("active", PALETTE["border"])],
+              foreground=[("disabled", PALETTE["disabled"])])
+        style.configure("Accent.TButton", font=self.fonts["button"],
+                padding=(p(14), p(7)), background=PALETTE["accent"],
+                foreground="#0d1b14", borderwidth=0)
+        style.map("Accent.TButton", background=[("disabled", PALETTE["border"]),
+                             ("pressed", PALETTE["accent_hover"]),
+                             ("active", PALETTE["accent_hover"])],
+              foreground=[("disabled", PALETTE["muted"])])
+        style.configure("Ghost.TButton", font=self.fonts["small"],
+                padding=(p(8), p(3)), background=PALETTE["surface"],
+                foreground=PALETTE["muted"])
+        style.map("Ghost.TButton", background=[("pressed", PALETTE["accent_soft"]),
+                            ("active", PALETTE["surface_alt"])],
+              foreground=[("active", PALETTE["ink"])])
+        style.configure("TEntry", padding=(p(7), p(5)),
+                fieldbackground=PALETTE["surface_alt"], foreground=PALETTE["ink"],
+                borderwidth=0, lightcolor=PALETTE["border"], darkcolor=PALETTE["border"])
+        style.map("TEntry", fieldbackground=[("focus", PALETTE["surface_alt"])],
+                  foreground=[("disabled", PALETTE["disabled"]), ("!disabled", PALETTE["ink"])])
+        style.configure("TCombobox", padding=p(5),
+                fieldbackground=PALETTE["surface_alt"], foreground=PALETTE["ink"],
+                background=PALETTE["surface_alt"], arrowcolor=PALETTE["muted"])
+        style.map("TCombobox", fieldbackground=[("disabled", PALETTE["surface"]),
+                                                ("readonly", PALETTE["surface_alt"])],
+                  foreground=[("disabled", PALETTE["disabled"]),
+                              ("!disabled", PALETTE["ink"])])
+        style.configure("TSpinbox", padding=p(3), arrowsize=p(12),
+                font=self.fonts["base"], fieldbackground=PALETTE["surface_alt"],
+                foreground=PALETTE["ink"], background=PALETTE["surface_alt"])
+        style.map("TSpinbox", fieldbackground=[("disabled", PALETTE["surface"]),
+                                              ("!disabled", PALETTE["surface_alt"])],
+                  foreground=[("disabled", PALETTE["disabled"]),
+                              ("!disabled", PALETTE["ink"])])
         style.configure("TCheckbutton", background=PALETTE["surface"],
-                        font=self.fonts["base"])
-        style.map("TCheckbutton", background=[("active", PALETTE["surface"])])
+                foreground=PALETTE["ink"], font=self.fonts["base"])
+        style.map("TCheckbutton", background=[("active", PALETTE["surface"]),
+                                              ("selected", PALETTE["surface"])],
+                  foreground=[("disabled", PALETTE["disabled"]),
+                              ("!disabled", PALETTE["ink"])])
+        style.configure("TPanedwindow", background=PALETTE["bg"], borderwidth=0)
         style.configure("TNotebook", background=PALETTE["bg"], borderwidth=0,
-                        tabmargins=(p(2), p(4), 0, 0))
-        style.configure("TNotebook.Tab", font=self.fonts["base"], padding=(p(14), p(7)))
-        style.map("TNotebook.Tab",
-                  background=[("selected", PALETTE["surface"])],
-                  foreground=[("disabled", PALETTE["muted"]),
-                              ("selected", PALETTE["accent"])])
+                tabmargins=(p(2), p(4), 0, 0))
+        style.configure("TNotebook.Tab", font=self.fonts["base"],
+                padding=(p(15), p(8)), background=PALETTE["surface_alt"],
+                foreground=PALETTE["muted"])
+        style.map("TNotebook.Tab", background=[("selected", PALETTE["surface"]),
+                            ("active", PALETTE["border"])],
+              foreground=[("disabled", PALETTE["muted"]),
+                      ("selected", PALETTE["accent"]),
+                      ("active", PALETTE["ink"])])
         style.configure("Treeview", font=self.fonts["base"], rowheight=p(27),
-                        background=PALETTE["surface"], fieldbackground=PALETTE["surface"],
-                        foreground=PALETTE["ink"], borderwidth=0)
+                background=PALETTE["surface"], fieldbackground=PALETTE["surface"],
+                foreground=PALETTE["ink"], borderwidth=0, relief="flat")
         style.map("Treeview", background=[("selected", PALETTE["accent_soft"])],
-                  foreground=[("selected", PALETTE["ink"])])
-        style.configure("Treeview.Heading", font=self.fonts["section"], padding=p(4))
+              foreground=[("selected", PALETTE["ink"])])
+        style.configure("Treeview.Heading", font=self.fonts["section"],
+                padding=(p(6), p(5)), background=PALETTE["surface_alt"],
+                foreground=PALETTE["muted"])
         style.configure("TProgressbar", thickness=p(10), background=PALETTE["accent"],
-                        troughcolor=PALETTE["accent_soft"], borderwidth=0)
+                troughcolor=PALETTE["surface_alt"], borderwidth=0)
         try:
             self.root.option_add("*TCombobox*Listbox.font", self.fonts["base"].name)
+            self.root.option_add("*Listbox.background", PALETTE["surface"])
+            self.root.option_add("*Listbox.foreground", PALETTE["ink"])
+            self.root.option_add("*Listbox.selectBackground", PALETTE["accent"])
+            self.root.option_add("*Listbox.selectForeground", PALETTE["bg"])
+            self.root.option_add("*TCombobox*Listbox.background", PALETTE["surface"])
+            self.root.option_add("*TCombobox*Listbox.foreground", PALETTE["ink"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground", PALETTE["accent"])
+            self.root.option_add("*TCombobox*Listbox.selectForeground", PALETTE["bg"])
+            self.root.option_add("*TEntry.foreground", PALETTE["ink"])
+            self.root.option_add("*TEntry.background", PALETTE["surface_alt"])
+            self.root.option_add("*Spinbox.foreground", PALETTE["ink"])
+            self.root.option_add("*Spinbox.background", PALETTE["surface_alt"])
         except tk.TclError:
             pass
 
@@ -4444,9 +4507,9 @@ class SubtitleStudio:
         header.pack(fill="x")
         title_block = ttk.Frame(header, style="Header.TFrame")
         title_block.pack(side="left")
-        ttk.Label(title_block, text="字幕工作台", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title_block, text="字幕工作台", style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(title_block, text="本地 Whisper 识别 · AI 并发翻译 · 字幕轨无损封装",
-                  style="Subtitle.TLabel").pack(anchor="w", pady=(self.px(2), 0))
+              style="HeaderSubtitle.TLabel").pack(anchor="w", pady=(self.px(2), 0))
         actions = ttk.Frame(header, style="Header.TFrame")
         actions.pack(side="right")
         self.load_subtitle_button = ttk.Button(actions, text="载入字幕…",
@@ -4455,11 +4518,17 @@ class SubtitleStudio:
         self.choose_button = ttk.Button(actions, text="选择媒体…", style="Accent.TButton",
                                         command=self._choose_media)
         self.choose_button.pack(side="right", padx=(0, self.px(10)))
+        tk.Frame(root, height=self.px(2), bg=PALETTE["accent"],
+                  highlightthickness=0).pack(fill="x", padx=self.px(18),
+                                        pady=(0, self.px(8)))
+
+        tk.Frame(root, height=self.px(1), bg=PALETTE["border"],
+                 highlightthickness=0).pack(fill="x", padx=self.px(18), pady=(0, self.px(6)))
 
         self.drop_label = tk.Label(
             root,
             text="拖入视频 / 音频 / 字幕文件 —— 支持一次拖入「媒体 + 同名字幕」，字幕也可单独拖入替换",
-            anchor="center", bg=PALETTE["drop_idle"], fg="#2f5a49",
+            anchor="center", bg=PALETTE["drop_idle"], fg=PALETTE["drop_text"],
             font=self.fonts["base"], padx=self.px(14), pady=self.px(8),
             highlightthickness=0)
         self.drop_label.pack(fill="x", padx=self.px(18), pady=(0, self.px(8)))
@@ -4473,15 +4542,22 @@ class SubtitleStudio:
 
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True, padx=self.px(18), pady=(0, self.px(10)))
-        left = ttk.Frame(body, style="Panel.TFrame")
-        right = ttk.Frame(body, style="Panel.TFrame")
-        body.add(left, weight=3)
-        body.add(right, weight=2)
+        left = ttk.Frame(body, style="Panel.TFrame", padding=self.px(0))
+        right = ttk.Frame(body, style="Panel.TFrame", padding=self.px(0))
+        body.add(left, weight=4)
+        body.add(right, weight=3)
 
-        self.preview_canvas = tk.Canvas(left, bg=PALETTE["preview"], highlightthickness=0,
-                                        height=self.px(400))
-        self.preview_canvas.pack(fill="both", expand=True,
-                                 padx=self.px(10), pady=(self.px(10), 0))
+        preview_shell = tk.Frame(left, bg=PALETTE["preview_stage"],
+                                 highlightbackground=PALETTE["border"],
+                                 highlightthickness=1, bd=0)
+        preview_shell.pack(fill="both", expand=True, padx=self.px(10), pady=(self.px(10), 0))
+        self.preview_stage = ttk.Frame(preview_shell, style="PreviewStage.TFrame")
+        self.preview_stage.pack(fill="both", expand=True, padx=self.px(1), pady=self.px(1))
+        self.preview_canvas = tk.Canvas(
+            self.preview_stage, bg=PALETTE["preview"], highlightthickness=0,
+            width=self.px(640), height=self.px(360))
+        self.preview_canvas.pack(anchor="center")
+        self.preview_stage.bind("<Configure>", self._resize_video_canvas)
         self.preview_canvas.bind("<Configure>", self._resize_video_canvas)
         self._draw_preview_placeholder("拖入媒体后在此预览画面\n播放时字幕会实时叠加（不会烧录）")
 
@@ -4511,8 +4587,12 @@ class SubtitleStudio:
                   justify="left", wraplength=self.px(680)).pack(
             fill="x", padx=self.px(12), pady=(self.px(4), self.px(10)))
 
-        self.notebook = ttk.Notebook(right)
-        self.notebook.pack(fill="both", expand=True)
+        right_shell = tk.Frame(right, bg=PALETTE["surface"],
+                              highlightbackground=PALETTE["border"],
+                              highlightthickness=1, bd=0)
+        right_shell.pack(fill="both", expand=True, padx=self.px(10), pady=self.px(10))
+        self.notebook = ttk.Notebook(right_shell)
+        self.notebook.pack(fill="both", expand=True, padx=self.px(1), pady=self.px(1))
         media_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
         asr_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
         self.notebook.add(media_tab, text="媒体与字幕")
@@ -4632,14 +4712,26 @@ class SubtitleStudio:
         lang_grid.columnconfigure(1, weight=1)
         ttk.Label(lang_grid, text="源语言", style="Surface.TLabel").grid(
             row=0, column=0, sticky="w", pady=self.px(2))
-        ttk.Combobox(lang_grid, textvariable=self.source_var, state="readonly",
-                     values=list(LANGUAGES)).grid(row=0, column=1, sticky="ew",
-                                                  padx=self.px(8), pady=self.px(2))
+        self.source_language_box = ttk.Combobox(
+            lang_grid, textvariable=self.source_var, state="readonly",
+            values=self._translation_language_options(include_auto=True))
+        self.source_language_box.grid(row=0, column=1, sticky="ew",
+                                      padx=self.px(8), pady=self.px(2))
+        self.source_language_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._select_custom_language(
+                self.source_var, self.source_language_box, "source"))
         ttk.Label(lang_grid, text="目标语言", style="Surface.TLabel").grid(
             row=1, column=0, sticky="w", pady=self.px(2))
-        ttk.Combobox(lang_grid, textvariable=self.target_var, state="readonly",
-                     values=[lang for lang in LANGUAGES if lang != "自动检测"]).grid(
-            row=1, column=1, sticky="ew", padx=self.px(8), pady=self.px(2))
+        self.target_language_box = ttk.Combobox(
+            lang_grid, textvariable=self.target_var, state="readonly",
+            values=self._translation_language_options(include_auto=False))
+        self.target_language_box.grid(row=1, column=1, sticky="ew",
+                                      padx=self.px(8), pady=self.px(2))
+        self.target_language_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._select_custom_language(
+                self.target_var, self.target_language_box, "target"))
         ttk.Label(lang_grid, text="翻译来源", style="Surface.TLabel").grid(
             row=2, column=0, sticky="w", pady=self.px(2))
         translate_source_box = ttk.Combobox(lang_grid, textvariable=self.translate_source_var,
@@ -4707,10 +4799,16 @@ class SubtitleStudio:
         # ---- 导出与封装（两大块：① 只导出单个字幕文件；② 只管压制字幕，互不影响）----
         export_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
         self.notebook.add(export_tab, text="导出与封装")
+        export_modes = ttk.Notebook(export_tab)
+        export_modes.pack(fill="both", expand=True)
+        file_export_tab = ttk.Frame(export_modes, style="Panel.TFrame", padding=self.px(12))
+        mux_tab = ttk.Frame(export_modes, style="Panel.TFrame", padding=self.px(12))
+        export_modes.add(file_export_tab, text="字幕文件导出")
+        export_modes.add(mux_tab, text="字幕轨压制")
 
-        ttk.Label(export_tab, text="① 导出字幕文件（单个文件）",
+        ttk.Label(file_export_tab, text="导出独立字幕文件",
                   style="Section.TLabel").pack(anchor="w")
-        file_grid = ttk.Frame(export_tab, style="Panel.TFrame")
+        file_grid = ttk.Frame(file_export_tab, style="Panel.TFrame")
         file_grid.pack(fill="x", pady=(self.px(4), 0))
         file_grid.columnconfigure(1, weight=1)
         ttk.Label(file_grid, text="字幕格式", style="Surface.TLabel").grid(
@@ -4732,30 +4830,21 @@ class SubtitleStudio:
                                         pady=self.px(3))
         self.subtitle_language_box.bind("<<ComboboxSelected>>",
                                         self._on_subtitle_language_change)
-        ttk.Label(export_tab, textvariable=self.export_file_hint_var,
+        ttk.Label(file_export_tab, textvariable=self.export_file_hint_var,
                   style="SurfaceMuted.TLabel", justify="left",
                   wraplength=self.px(520)).pack(anchor="w", pady=(self.px(4), 0))
-        file_actions = ttk.Frame(export_tab, style="Panel.TFrame")
+        file_actions = ttk.Frame(file_export_tab, style="Panel.TFrame")
         file_actions.pack(fill="x", pady=(self.px(4), 0))
-        self.export_button = ttk.Button(file_actions, text="导出字幕文件",
+        self.export_button = ttk.Button(file_actions, text="导出当前文件",
                                         command=self._start_export)
         self.export_button.pack(side="left")
-        self.plan_export_button = ttk.Button(file_actions, text="加入计划",
+        self.plan_export_button = ttk.Button(file_actions, text="加入计划：导出字幕",
                                              command=self._plan_add_export)
         self.plan_export_button.pack(side="left", padx=(self.px(6), 0))
 
-        ttk.Label(export_tab, text="② 压制字幕（不烧录画面）",
+        ttk.Label(mux_tab, text="将字幕封装为独立轨道，不会烧录到画面",
                   style="Section.TLabel").pack(anchor="w", pady=(self.px(6), 0))
-        # 压制按钮先占住底部，避免内容变高时被挤出可视区
-        mux_actions = ttk.Frame(export_tab, style="Panel.TFrame")
-        mux_actions.pack(fill="x", side="bottom", pady=(self.px(6), 0))
-        self.mux_button = ttk.Button(mux_actions, text="压制字幕", style="Accent.TButton",
-                                     command=self._start_mux)
-        self.mux_button.pack(side="left")
-        self.plan_mux_button = ttk.Button(mux_actions, text="加入计划",
-                                          command=self._plan_add_mux)
-        self.plan_mux_button.pack(side="left", padx=(self.px(6), 0))
-        track_row = ttk.Frame(export_tab, style="Panel.TFrame")
+        track_row = ttk.Frame(mux_tab, style="Panel.TFrame")
         track_row.pack(fill="x", pady=(self.px(4), 0))
         track_row.columnconfigure(0, weight=1)
         self.mux_track_kind_box = ttk.Combobox(track_row,
@@ -4766,7 +4855,7 @@ class SubtitleStudio:
         self.mux_track_add_button = ttk.Button(track_row, text="添加", style="Ghost.TButton",
                                                command=self._add_mux_track)
         self.mux_track_add_button.grid(row=0, column=1, padx=(self.px(6), 0))
-        mux_tracks_wrap = ttk.Frame(export_tab, style="Panel.TFrame")
+        mux_tracks_wrap = ttk.Frame(mux_tab, style="Panel.TFrame")
         mux_tracks_wrap.pack(fill="x", pady=(self.px(6), 0))
         self.mux_tracks_tree = ttk.Treeview(mux_tracks_wrap,
                                             columns=("order", "label", "language"),
@@ -4784,17 +4873,17 @@ class SubtitleStudio:
         self.mux_tracks_tree.configure(yscrollcommand=mux_tracks_scroll.set)
         self.mux_tracks_tree.pack(side="left", fill="both", expand=True)
         mux_tracks_scroll.pack(side="right", fill="y")
-        mux_track_actions = ttk.Frame(export_tab, style="Panel.TFrame")
+        mux_track_actions = ttk.Frame(mux_tab, style="Panel.TFrame")
         mux_track_actions.pack(fill="x", pady=(self.px(2), 0))
         for text, command in (("移除", self._remove_mux_track),
                               ("设为默认", self._set_default_mux_track),
                               ("清空", self._clear_mux_tracks)):
             ttk.Button(mux_track_actions, text=text, style="Ghost.TButton",
                        command=command).pack(side="left", padx=(0, self.px(6)))
-        ttk.Label(export_tab, textvariable=self.export_hint_var, style="SurfaceMuted.TLabel",
+        ttk.Label(mux_tab, textvariable=self.export_hint_var, style="SurfaceMuted.TLabel",
                   justify="left", wraplength=self.px(520)).pack(
             anchor="w", pady=(self.px(4), 0))
-        mux_check_row = ttk.Frame(export_tab, style="Panel.TFrame")
+        mux_check_row = ttk.Frame(mux_tab, style="Panel.TFrame")
         mux_check_row.pack(fill="x", pady=(self.px(4), 0))
         self.mux_check = ttk.Checkbutton(
             mux_check_row, text="压制前检查重复字幕（同语言且内容雷同才算重复）",
@@ -4808,17 +4897,18 @@ class SubtitleStudio:
         self.mux_threshold_spinbox.pack(side="left")
         ttk.Label(mux_check_row, text=f"%（{DUPLICATE_AI_LOW}–阈值交 AI 判语义）",
                   style="SurfaceMuted.TLabel").pack(side="left", padx=(self.px(4), 0))
-        mux_subs_head = ttk.Frame(export_tab, style="Panel.TFrame")
+        mux_subs_head = ttk.Frame(mux_tab, style="Panel.TFrame")
         mux_subs_head.pack(fill="x", pady=(self.px(8), self.px(2)))
         ttk.Button(mux_subs_head, text="全部删除", style="Ghost.TButton",
                    command=lambda: self._set_all_mux_subs(False)).pack(side="right")
         ttk.Button(mux_subs_head, text="全部保留", style="Ghost.TButton",
                    command=lambda: self._set_all_mux_subs(True)).pack(
             side="right", padx=(0, self.px(6)))
-        ttk.Label(mux_subs_head, text="原有内嵌字幕（取消勾选 = 压制时删除该字幕轨）",
-                  style="Section.TLabel").pack(side="left")
+        ttk.Label(mux_subs_head, text="原有内嵌字幕", style="Section.TLabel").pack(side="left")
+        ttk.Label(mux_tab, text="勾选 = 保留；取消勾选 = 压制时删除该字幕轨",
+              style="SurfaceMuted.TLabel").pack(anchor="w", pady=(0, self.px(2)))
         # 字幕轨很多时限高滚动，避免把导出页撑高（三个按钮 / 下拉框仍始终可见）
-        mux_subs_wrap = ttk.Frame(export_tab, style="Panel.TFrame")
+        mux_subs_wrap = ttk.Frame(mux_tab, style="Panel.TFrame")
         mux_subs_wrap.pack(fill="x")
         self.mux_subs_canvas = tk.Canvas(mux_subs_wrap, bg=PALETTE["surface"],
                                         highlightthickness=0, bd=0,
@@ -4826,7 +4916,7 @@ class SubtitleStudio:
         mux_subs_scroll = ttk.Scrollbar(mux_subs_wrap, orient="vertical",
                                         command=self.mux_subs_canvas.yview)
         self.mux_subs_canvas.configure(yscrollcommand=mux_subs_scroll.set)
-        self.mux_subs_canvas.pack(side="left", fill="x", expand=True)
+        self.mux_subs_canvas.pack(side="left", fill="x", expand=False)
         mux_subs_scroll.pack(side="right", fill="y")
         self.mux_subs_frame = ttk.Frame(self.mux_subs_canvas, style="Panel.TFrame")
         self._mux_subs_window = self.mux_subs_canvas.create_window(
@@ -4841,6 +4931,15 @@ class SubtitleStudio:
                                                             width=event.width))
         for widget in (self.mux_subs_canvas, self.mux_subs_frame):
             widget.bind("<MouseWheel>", self._on_mux_subs_wheel)
+
+        mux_actions = ttk.Frame(mux_tab, style="Panel.TFrame")
+        mux_actions.pack(fill="x", pady=(self.px(8), 0))
+        self.mux_button = ttk.Button(mux_actions, text="压制当前文件",
+                                     style="Accent.TButton", command=self._start_mux)
+        self.mux_button.pack(side="left")
+        self.plan_mux_button = ttk.Button(mux_actions, text="加入计划：压制字幕",
+                                          command=self._plan_add_mux)
+        self.plan_mux_button.pack(side="left", padx=(self.px(6), 0))
 
         # ---- 计划任务 ----
         plan_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
@@ -4919,9 +5018,9 @@ class SubtitleStudio:
         self.plan_files_tree.pack(side="left", fill="both", expand=True)
         files_scroll.pack(side="right", fill="y")
         self.plan_files_tree.tag_configure("running", background=PALETTE["accent_soft"])
-        self.plan_files_tree.tag_configure("done", background="#e4f3ea")
-        self.plan_files_tree.tag_configure("failed", background="#f8e5e1")
-        self.plan_files_tree.tag_configure("skipped", background="#fdf3d8")
+        self.plan_files_tree.tag_configure("done", background=PALETTE["done"])
+        self.plan_files_tree.tag_configure("failed", background=PALETTE["failed"])
+        self.plan_files_tree.tag_configure("skipped", background=PALETTE["skipped"])
         self.plan_files_tree.tag_configure("step", foreground=PALETTE["muted"])
 
         plan_options = ttk.Frame(plan_tab, style="Panel.TFrame")
@@ -5108,6 +5207,7 @@ class SubtitleStudio:
         canvas = getattr(self, "preview_canvas", None)
         if canvas is None:
             return
+        self._fit_preview_canvas()
         canvas.delete("all")
         if not message:
             return
@@ -5249,6 +5349,39 @@ class SubtitleStudio:
         except (TypeError, ValueError):
             return DUPLICATE_THRESHOLD_DEFAULT
         return max(DUPLICATE_AI_LOW, min(100, value))
+
+    def _translation_language_options(self, *, include_auto: bool) -> list[str]:
+        languages = [language for language in LANGUAGES
+                     if include_auto or language != "自动检测"]
+        return [*languages, *self.custom_translation_languages, CUSTOM_LANGUAGE_ENTRY]
+
+    def _select_custom_language(self, variable: tk.StringVar, combobox,
+                                language_kind: str):
+        selected = variable.get()
+        previous_attr = f"_{language_kind}_language_previous"
+        if selected != CUSTOM_LANGUAGE_ENTRY:
+            setattr(self, previous_attr, selected)
+            return
+
+        previous = getattr(self, previous_attr)
+        label = "源语言" if language_kind == "source" else "目标语言"
+        value = simpledialog.askstring(
+            "自定义翻译语言", f"请输入{label}名称（例如：粤语、古希腊语或 Klingon）：",
+            parent=self.root)
+        value = str(value or "").strip()
+        if not value or value == CUSTOM_LANGUAGE_ENTRY:
+            variable.set(previous)
+            return
+
+        if value not in LANGUAGES and value not in self.custom_translation_languages:
+            self.custom_translation_languages.append(value)
+        self.source_language_box.configure(
+            values=self._translation_language_options(include_auto=True))
+        self.target_language_box.configure(
+            values=self._translation_language_options(include_auto=False))
+        variable.set(value)
+        setattr(self, previous_attr, value)
+        self.status_var.set(f"已选择自定义{label}：{value}")
 
     def _on_translate_source_change(self, _event=None):
         self._update_translate_source_hint()
@@ -5852,6 +5985,7 @@ class SubtitleStudio:
             return
         self.current_frame = frame
         self._preview_message = None
+        self._fit_preview_canvas()
         current_ms = self._capture_time_ms()
         if current_ms is not None:
             seconds = current_ms / 1000.0
@@ -6178,7 +6312,25 @@ class SubtitleStudio:
         except OSError:
             self.preview_audio_process = None
 
+    def _fit_preview_canvas(self):
+        canvas = getattr(self, "preview_canvas", None)
+        stage = getattr(self, "preview_stage", None)
+        if canvas is None or stage is None:
+            return
+        max_width = max(2, stage.winfo_width() - self.px(24))
+        max_height = max(2, stage.winfo_height() - self.px(24))
+        if self.current_frame is not None:
+            frame_height, frame_width = self.current_frame.shape[:2]
+        else:
+            frame_width, frame_height = 16, 9
+        scale = min(max_width / frame_width, max_height / frame_height)
+        width = max(2, int(round(frame_width * scale)))
+        height = max(2, int(round(frame_height * scale)))
+        if (int(canvas.cget("width")), int(canvas.cget("height"))) != (width, height):
+            canvas.configure(width=width, height=height)
+
     def _resize_video_canvas(self, _event=None):
+        self._fit_preview_canvas()
         if self.current_frame is not None:
             self._render_video_frame()
         elif self._preview_message:
