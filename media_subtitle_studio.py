@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import ctypes
 import difflib
 from enum import Enum, auto
 import functools
+import html
 from html.parser import HTMLParser
 import importlib
 import importlib.util
@@ -30,24 +32,22 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
-
-try:
-    _tkinterdnd2 = importlib.import_module("tkinterdnd2")
-    DND_FILES = _tkinterdnd2.DND_FILES
-    TkinterDnD = _tkinterdnd2.TkinterDnD
-except ImportError:
-    DND_FILES = None
-    TkinterDnD = None
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QTextDocument
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
+    QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QTableView,
+    QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+)
 
 try:
     Image = importlib.import_module("PIL.Image")
     ImageDraw = importlib.import_module("PIL.ImageDraw")
     ImageFont = importlib.import_module("PIL.ImageFont")
-    ImageTk = importlib.import_module("PIL.ImageTk")
 except ImportError:
-    Image = ImageDraw = ImageFont = ImageTk = None
+    Image = ImageDraw = ImageFont = None
 
 try:
     cv2 = importlib.import_module("cv2")
@@ -144,25 +144,25 @@ FONT_PATHS = (
     r"C:\Windows\Fonts\arial.ttf",
 )
 PALETTE = {
-    "bg": "#0b1220",
-    "surface": "#111c2e",
-    "surface_alt": "#17263d",
-    "border": "#2d4d73",
-    "ink": "#ebf3ff",
-    "muted": "#a7bcdb",
-    "accent": "#4a90ff",
-    "accent_hover": "#2f73eb",
-    "accent_soft": "#1a3d68",
-    "drop_idle": "#12233a",
-    "drop_hover": "#18365d",
-    "drop_text": "#dfeeff",
-    "preview_stage": "#0d1727",
-    "preview": "#060c14",
-    "preview_text": "#dfe9ff",
-    "disabled": "#6d7d99",
-    "done": "#123c5b",
-    "failed": "#4b2d3a",
-    "skipped": "#473b1f",
+    "bg": "#eef2ef",
+    "surface": "#ffffff",
+    "surface_alt": "#f5f9f6",
+    "border": "#d9e2db",
+    "ink": "#1d2c26",
+    "muted": "#68786f",
+    "accent": "#0b7d5b",
+    "accent_hover": "#096a4d",
+    "accent_soft": "#dff0e8",
+    "drop_idle": "#e3efe8",
+    "drop_hover": "#cae4d5",
+    "drop_text": "#2f5a49",
+    "preview_stage": "#e3efe8",
+    "preview": "#0e1512",
+    "preview_text": "#d6e4dc",
+    "disabled": "#9aa8a0",
+    "done": "#e4f3ea",
+    "failed": "#f8e5e1",
+    "skipped": "#fdf3d8",
 }
 UI_FONT_STACK = ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Tahoma")
 LOG_FONT_STACK = ("Cascadia Mono", "Consolas", "Courier New")
@@ -189,9 +189,9 @@ MAX_OUTPUT_TOKENS_BATCH_CAP = 32000 # 整段模式输出上限
 
 BATCH_SIZE_MIN = 2              # 每批最少行数
 BATCH_SIZE_MAX = 50             # 每批最多行数
-DEFAULT_BATCH_SIZE = 30         # 每次启动的默认值（会话级，不持久化）
+DEFAULT_BATCH_SIZE = 10         # 每次启动的默认值（会话级，不持久化）
 
-DEFAULT_CONTEXT_LINES = 5       # 翻译上下文：前后各 N 条非空字幕（仅参考，不翻译）
+DEFAULT_CONTEXT_LINES = 3       # 翻译上下文：前后各 N 条非空字幕（仅参考，不翻译）
 CONTEXT_LINES_MAX = 10          # 上下文句数上限
 
 
@@ -1294,19 +1294,23 @@ def enable_dpi_awareness() -> None:
         pass
 
 
-def window_dpi(window: tk.Misc) -> int:
-    """读取窗口当前所在显示器的 DPI；API 不可用时回退到 Tk 估算值或 96。"""
+def window_dpi(window=None) -> int:
+    """读取窗口设备缩放；不可用时回退到系统 DPI 或 96。"""
+    if window is not None:
+        try:
+            ratio = float(window.devicePixelRatioF())
+            if ratio > 0:
+                return max(96, int(round(96 * ratio)))
+        except Exception:
+            pass
     if os.name == "nt":
         try:
-            dpi = int(ctypes.windll.user32.GetDpiForWindow(ctypes.c_void_p(window.winfo_id())))
+            dpi = int(ctypes.windll.user32.GetDpiForSystem())
             if dpi > 0:
                 return dpi
         except Exception:
             pass
-    try:
-        return max(96, int(round(float(window.winfo_fpixels("1i")))))
-    except Exception:
-        return 96
+    return 96
 
 
 _PRECISE_TIMER = {"active": False}
@@ -4136,71 +4140,126 @@ def create_audio_clock(media_path, ffmpeg: str | None, audio_ordinal: int = 0):
     return None
 
 
-class SubtitleStudio:
-    BASE_WIDTH = 1210
-    BASE_HEIGHT = 812
-    BASE_MIN_WIDTH = 940
-    BASE_MIN_HEIGHT = 620
-    MAX_CONCURRENT = 100
+class _QtTaskSignals(QObject):
+    result = Signal(object)
+    error = Signal(str, str)
+    progress = Signal(int, int)
+    log = Signal(str)
+    status = Signal(str)
+    finished = Signal(object)
 
+
+class _QtTask(QRunnable):
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+        self.signals = _QtTaskSignals()
+
+    def run(self):
+        try:
+            self.signals.result.emit(self.function(self.signals))
+        except Exception as exc:
+            self.signals.error.emit(str(exc), traceback.format_exc())
+        finally:
+            self.signals.finished.emit(self)
+
+
+class _SubtitleTableModel(QAbstractTableModel):
+    HEADERS = ("#", "开始", "字幕文本")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.entries: list[dict] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.entries)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        entry = self.entries[index.row()]
+        column = index.column()
+        if column == 0:
+            return str(index.row() + 1)
+        if column == 1:
+            milliseconds = max(0, int(entry.get("start_ms") or 0))
+            seconds = milliseconds // 1000
+            return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        return str(entry.get("text") or "").replace("\n", " / ")
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return None
+
+    def set_entries(self, entries: list[dict]):
+        self.beginResetModel()
+        self.entries = entries
+        self.endResetModel()
+
+
+class SubtitleStudio(QMainWindow):
     def __init__(self, initial_path: str | None = None):
-        enable_dpi_awareness()
-        self.root = (TkinterDnD.Tk() if TkinterDnD else tk.Tk())
-        self.root.title(APP_TITLE)
-        set_console_echo(True)          # GUI 下也在命令行回显 Whisper / AI 的返回
-        console_echo("GUI", "控制台回显已开启：Whisper 识别结果与 AI 接口返回都会打印在这里"
-                            f"（关闭：set {CONSOLE_ECHO_ENV}=0）")
-        self.root.configure(background=PALETTE["bg"])
-        self.root.update_idletasks()
-        self.dpi = window_dpi(self.root)
-        self.scale = max(1.0, self.dpi / 96.0)
-        self.root.tk.call("tk", "scaling", self.dpi / 72.0)
-        self.style = ttk.Style(self.root)
-        self.style.theme_use("clam")
-        self.fonts: dict[str, tkfont.Font] = {}
-
-        self.path_var = tk.StringVar()
-        self.position_var = tk.DoubleVar(value=0.0)
-        self.source_var = tk.StringVar(value="自动检测")
-        self.target_var = tk.StringVar(value="中文（简体）")
-        self.custom_translation_languages: list[str] = []
-        self._source_language_previous = self.source_var.get()
-        self._target_language_previous = self.target_var.get()
-        self.asr_language_var = tk.StringVar(value="自动检测")
-        self.whisper_model_var = tk.StringVar(value=default_whisper_model())
-        self.translation_model_var = tk.StringVar(value=default_translation_model())
-        self.translation_concurrency_var = tk.StringVar(
-            value=str(default_translation_concurrency()))
-        self.subtitle_format_var = tk.StringVar(value="SRT")
-        self.subtitle_language_var = tk.StringVar(value="原文")
-        self.translate_source_var = tk.StringVar(value=TRANSLATE_SOURCE_ASR)
-        self.mux_check_var = tk.BooleanVar(value=True)
-        self.mux_threshold_var = tk.StringVar(value=str(DUPLICATE_THRESHOLD_DEFAULT))
-        self.mux_track_kind_var = tk.StringVar(value=MUX_TRACK_ORIGINAL)
-        self.group_translation_var = tk.BooleanVar(value=False)
-        self.batch_size_var = tk.StringVar(value=str(subtitles.DEFAULT_BATCH_SIZE))
-        self.context_lines_var = tk.StringVar(value=str(DEFAULT_CONTEXT_LINES))
-        self.status_var = tk.StringVar(value="拖入视频 / 音频 / 字幕，或点击右上角「选择媒体…」")
-        self.caption_var = tk.StringVar(
-            value="播放时字幕按文件自身格式叠加渲染（不会烧录）；画面跟随音频时钟，"
-                  "如有残留偏差可用右侧「同步」微调（正数 = 画面延后）。")
-        self.sync_offset_var = tk.StringVar(value="0.0")
-        self.sync_offset_var.trace_add("write", self._on_sync_change)
-        self.time_label_var = tk.StringVar(value="00:00 / 00:00")
-        self.media_stats_var = tk.StringVar(value="拖入媒体文件后显示轨道信息。")
-        self.entry_stats_var = tk.StringVar(value="0 条")
-        self.asr_status_var = tk.StringVar(value="")
-        self.translate_progress_var = tk.StringVar(value="载入或识别字幕后即可开始翻译。")
-        self.translate_source_hint_var = tk.StringVar(value="")
-        self.export_hint_var = tk.StringVar(value="载入媒体后显示预计输出文件名。")
-        self.export_file_hint_var = tk.StringVar(value="载入媒体后显示预计输出文件名。")
-        self.model_detail_var = tk.StringVar(value="")
-        self.plan_status_var = tk.StringVar(
-            value="在「识别 / 翻译 / 导出与封装」里把设置加入计划，再添加要处理的文件。")
-        self.plan_progress_var = tk.StringVar(value="总进度：未开始。")
-        self.plan_token_var = tk.StringVar(value="Token：本文件 — · 总计 —")
-        self.plan_continue_var = tk.BooleanVar(value=True)
-
+        app = QApplication.instance() or QApplication([])
+        super().__init__()
+        self._app = app
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1320, 860)
+        self.setMinimumSize(980, 650)
+        self.setAcceptDrops(True)
+        self.setStyleSheet("""
+            QWidget { background: #eef2ef; color: #1d2c26; font-size: 10pt; }
+            QTabWidget::pane { background: white; border: 1px solid #d9e2db; }
+            QTabBar::tab { padding: 8px 12px; background: #e4eae5; }
+            QTabBar::tab:selected { background: white; color: #0b7d5b; }
+            QPushButton { padding: 6px 10px; background: white; border: 1px solid #cbd7ce; }
+            QPushButton:hover { background: #e1eee6; }
+            QPushButton:disabled { color: #87948c; }
+            QPushButton#primary { color: white; background: #0b7d5b; border: 0; }
+            QComboBox, QTreeWidget, QTableView {
+                background: white; border: 1px solid #d9e2db; padding: 4px;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background: white; border: 1px solid #d9e2db; padding: 4px;
+                padding-right: 22px;
+            }
+            QSpinBox::up-button, QDoubleSpinBox::up-button {
+                subcontrol-origin: border; subcontrol-position: top right;
+                width: 18px; border: 0; background: #f5f9f6;
+            }
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                subcontrol-origin: border; subcontrol-position: bottom right;
+                width: 18px; border: 0; background: #f5f9f6;
+            }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+                background: #e1eee6;
+            }
+            QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+            QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+                background: #dff0e8;
+            }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: none; width: 0; height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 5px solid #68786f;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: none; width: 0; height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #68786f;
+            }
+            QProgressBar { background: #dff0e8; border: 0; height: 12px; }
+            QProgressBar::chunk { background: #0b7d5b; }
+        """)
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(max(2, min(4, QThreadPool.globalInstance().maxThreadCount())))
+        self._workers: set[_QtTask] = set()
         self.media_path: Path | None = None
         self.media_info: dict = {}
         self.audio_tracks: list[dict] = []
@@ -4209,3308 +4268,1362 @@ class SubtitleStudio:
         self.entries: list[dict] = []
         self.original_entries: list[dict] = []
         self.translated: list[dict] = []
-        self.subtitle_source: dict | None = None
-        self.preview_photo = None
-        self.video_capture = None
-        self.video_fps = 25.0
-        self.video_duration = 0.0
-        self.video_playing = False
-        self.video_after = None
-        self.current_frame = None
-        self.updating_position = False
-        self.preview_audio_process = None
-        self.audio_clock = None
-        self._audio_clock_kind = ""
-        self._play_anchor_wall = 0.0
-        self._play_anchor_media = 0.0
-        self._caption_cache: dict = {}
-        self._photo_image = None
-        self._photo_size: tuple[int, int] | None = None
-        self.events: queue.Queue = queue.Queue()
-        self.busy = False
-        self.translate_running = False
-        self.translate_cancel_event: threading.Event | None = None
-        self._audio_index = 0
-        self._subtitle_index = 0
-        self._subtitle_options: list[str] = ["不使用字幕", SUBTITLE_IMPORT_ENTRY]
-        self._last_translation_model: str | None = None
-        self._preview_message: str | None = None
-        self._pending_subtitle: Path | None = None
-        self._mux_tracks: list[dict] = []              # 要输出 / 压制的字幕轨（可多条）
-        self._mux_sub_keep: dict[int, bool] = {}        # 内嵌字幕序号 → 是否保留
-        self._mux_sub_vars: dict[int, tk.BooleanVar] = {}
-        self._mux_sub_checks: list[ttk.Checkbutton] = []
-        self._plan_steps: list[dict] = []
-        self._plan_files: list[Path] = []
-        self._plan_status: dict[str, str] = {}
-        self._plan_cancel: threading.Event | None = None
-        self.plan_running = False
-        self._plan_ok = 0
-        self._plan_failed = 0
-        self._plan_skipped = 0
-        self._skipped_notes: list[str] = []
-        self._pending_mux: list[dict] = []   # 没找到对应字幕的外部字幕轨（结束后弹窗补选）
-        self._plan_file_steps: dict[str, list[dict]] = {}   # 文件 → 本次执行的各步骤明细
-        self._plan_total_steps = 0
-        self._plan_steps_done = 0
-        self._plan_tokens_total = 0
-        self._plan_current_step_text = ""
-
-        self._apply_theme()
-        self._place_window()
-        self._build()
-        self.root.protocol("WM_DELETE_WINDOW", self._close_window)
-        self._closing = False
-        self._poll_after = self.root.after(80, self._poll_events)
-        self._dpi_after = self.root.after(1500, self._watch_dpi)
+        self.mux_tracks: list[dict] = []
+        self.plan_steps: list[dict] = []
+        self.plan_files: list[Path] = []
+        self.plan_edit_controls: list[QPushButton] = []
+        self.plan_cancel: threading.Event | None = None
+        self.translate_cancel: threading.Event | None = None
+        self._pending_mux: list[dict] = []
+        self._busy = False
+        self._video = None
+        self._video_duration = 0.0
+        self._video_fps = 25.0
+        self._play_started = 0.0
+        self._play_position = 0.0
+        self._seek_pending = False
+        self._subtitle_starts: list[int] = []
+        self._caption_cache: dict[tuple[int, str, int, int], QPixmap] = {}
+        self._audio_clock = None
+        self._audio_process = None
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setInterval(33)
+        self._frame_timer.timeout.connect(self._video_tick)
+        self._build_ui()
+        self._set_status("拖入媒体 / 字幕，或点击“选择媒体”")
         if initial_path:
-            self.root.after(250, lambda: self.load_media(initial_path))
-
-    # ------------------------------------------------------- 高 DPI 适配与主题
-    def px(self, value: float) -> int:
-        return max(1, int(round(value * self.scale)))
-
-    def _pick_family(self, stack: tuple[str, ...]) -> str:
-        try:
-            installed = {name.casefold() for name in tkfont.families(self.root)}
-        except tk.TclError:
-            installed = set()
-        for name in stack:
-            if name.casefold() in installed:
-                return name
-        try:
-            return tkfont.nametofont("TkDefaultFont").actual("family")
-        except tk.TclError:
-            return "TkDefaultFont"
-
-    def _apply_theme(self):
-        ui_family = self._pick_family(UI_FONT_STACK)
-        log_family = self._pick_family(LOG_FONT_STACK)
-        self.fonts = {
-            "base": tkfont.Font(root=self.root, family=ui_family, size=10),
-            "small": tkfont.Font(root=self.root, family=ui_family, size=9),
-            "section": tkfont.Font(root=self.root, family=ui_family, size=10, weight="bold"),
-            "title": tkfont.Font(root=self.root, family=ui_family, size=17, weight="bold"),
-            "button": tkfont.Font(root=self.root, family=ui_family, size=10),
-            "mono": tkfont.Font(root=self.root, family=log_family, size=9),
-        }
-        p = self.px
-        style = self.style
-        style.configure("TFrame", background=PALETTE["bg"])
-        style.configure("Header.TFrame", background=PALETTE["surface"])
-        style.configure("Panel.TFrame", background=PALETTE["surface"])
-        style.configure("PreviewStage.TFrame", background=PALETTE["preview_stage"])
-        style.configure("TLabel", background=PALETTE["bg"], foreground=PALETTE["ink"],
-                        font=self.fonts["base"])
-        style.configure("Surface.TLabel", background=PALETTE["surface"],
-                        foreground=PALETTE["ink"], font=self.fonts["base"])
-        style.configure("Muted.TLabel", background=PALETTE["bg"],
-                        foreground=PALETTE["muted"], font=self.fonts["small"])
-        style.configure("SurfaceMuted.TLabel", background=PALETTE["surface"],
-                        foreground=PALETTE["muted"], font=self.fonts["small"])
-        style.configure("Title.TLabel", background=PALETTE["bg"], foreground=PALETTE["ink"],
-                        font=self.fonts["title"])
-        style.configure("Subtitle.TLabel", background=PALETTE["bg"],
-                        foreground=PALETTE["muted"], font=self.fonts["small"])
-        style.configure("HeaderTitle.TLabel", background=PALETTE["surface"],
-                foreground=PALETTE["ink"], font=self.fonts["title"])
-        style.configure("HeaderSubtitle.TLabel", background=PALETTE["surface"],
-                foreground=PALETTE["muted"], font=self.fonts["small"])
-        style.configure("Section.TLabel", background=PALETTE["surface"],
-                        foreground=PALETTE["ink"], font=self.fonts["section"])
-        style.configure("TButton", font=self.fonts["button"], padding=(p(12), p(6)),
-                background=PALETTE["surface_alt"], foreground=PALETTE["ink"])
-        style.map("TButton", background=[("disabled", PALETTE["surface"]),
-                          ("pressed", PALETTE["accent_soft"]),
-                          ("active", PALETTE["border"])],
-              foreground=[("disabled", PALETTE["disabled"])])
-        style.configure("Accent.TButton", font=self.fonts["button"],
-                padding=(p(14), p(7)), background=PALETTE["accent"],
-                foreground="#0d1b14", borderwidth=0)
-        style.map("Accent.TButton", background=[("disabled", PALETTE["border"]),
-                             ("pressed", PALETTE["accent_hover"]),
-                             ("active", PALETTE["accent_hover"])],
-              foreground=[("disabled", PALETTE["muted"])])
-        style.configure("Ghost.TButton", font=self.fonts["small"],
-                padding=(p(8), p(3)), background=PALETTE["surface"],
-                foreground=PALETTE["muted"])
-        style.map("Ghost.TButton", background=[("pressed", PALETTE["accent_soft"]),
-                            ("active", PALETTE["surface_alt"])],
-              foreground=[("active", PALETTE["ink"])])
-        style.configure("TEntry", padding=(p(7), p(5)),
-                fieldbackground=PALETTE["surface_alt"], foreground=PALETTE["ink"],
-                borderwidth=0, lightcolor=PALETTE["border"], darkcolor=PALETTE["border"])
-        style.map("TEntry", fieldbackground=[("focus", PALETTE["surface_alt"])],
-                  foreground=[("disabled", PALETTE["disabled"]), ("!disabled", PALETTE["ink"])])
-        style.configure("TCombobox", padding=p(5),
-                fieldbackground=PALETTE["surface_alt"], foreground=PALETTE["ink"],
-                background=PALETTE["surface_alt"], arrowcolor=PALETTE["muted"])
-        style.map("TCombobox", fieldbackground=[("disabled", PALETTE["surface"]),
-                                                ("readonly", PALETTE["surface_alt"])],
-                  foreground=[("disabled", PALETTE["disabled"]),
-                              ("!disabled", PALETTE["ink"])])
-        style.configure("TSpinbox", padding=p(3), arrowsize=p(12),
-                font=self.fonts["base"], fieldbackground=PALETTE["surface_alt"],
-                foreground=PALETTE["ink"], background=PALETTE["surface_alt"])
-        style.map("TSpinbox", fieldbackground=[("disabled", PALETTE["surface"]),
-                                              ("!disabled", PALETTE["surface_alt"])],
-                  foreground=[("disabled", PALETTE["disabled"]),
-                              ("!disabled", PALETTE["ink"])])
-        style.configure("TCheckbutton", background=PALETTE["surface"],
-                foreground=PALETTE["ink"], font=self.fonts["base"])
-        style.map("TCheckbutton", background=[("active", PALETTE["surface"]),
-                                              ("selected", PALETTE["surface"])],
-                  foreground=[("disabled", PALETTE["disabled"]),
-                              ("!disabled", PALETTE["ink"])])
-        style.configure("TPanedwindow", background=PALETTE["bg"], borderwidth=0)
-        style.configure("TNotebook", background=PALETTE["bg"], borderwidth=0,
-                tabmargins=(p(2), p(4), 0, 0))
-        style.configure("TNotebook.Tab", font=self.fonts["base"],
-                padding=(p(15), p(8)), background=PALETTE["surface_alt"],
-                foreground=PALETTE["muted"])
-        style.map("TNotebook.Tab", background=[("selected", PALETTE["surface"]),
-                            ("active", PALETTE["border"])],
-              foreground=[("disabled", PALETTE["muted"]),
-                      ("selected", PALETTE["accent"]),
-                      ("active", PALETTE["ink"])])
-        style.configure("Treeview", font=self.fonts["base"], rowheight=p(27),
-                background=PALETTE["surface"], fieldbackground=PALETTE["surface"],
-                foreground=PALETTE["ink"], borderwidth=0, relief="flat")
-        style.map("Treeview", background=[("selected", PALETTE["accent_soft"])],
-              foreground=[("selected", PALETTE["ink"])])
-        style.configure("Treeview.Heading", font=self.fonts["section"],
-                padding=(p(6), p(5)), background=PALETTE["surface_alt"],
-                foreground=PALETTE["muted"])
-        style.configure("TProgressbar", thickness=p(10), background=PALETTE["accent"],
-                troughcolor=PALETTE["surface_alt"], borderwidth=0)
-        try:
-            self.root.option_add("*TCombobox*Listbox.font", self.fonts["base"].name)
-            self.root.option_add("*Listbox.background", PALETTE["surface"])
-            self.root.option_add("*Listbox.foreground", PALETTE["ink"])
-            self.root.option_add("*Listbox.selectBackground", PALETTE["accent"])
-            self.root.option_add("*Listbox.selectForeground", PALETTE["bg"])
-            self.root.option_add("*TCombobox*Listbox.background", PALETTE["surface"])
-            self.root.option_add("*TCombobox*Listbox.foreground", PALETTE["ink"])
-            self.root.option_add("*TCombobox*Listbox.selectBackground", PALETTE["accent"])
-            self.root.option_add("*TCombobox*Listbox.selectForeground", PALETTE["bg"])
-            self.root.option_add("*TEntry.foreground", PALETTE["ink"])
-            self.root.option_add("*TEntry.background", PALETTE["surface_alt"])
-            self.root.option_add("*Spinbox.foreground", PALETTE["ink"])
-            self.root.option_add("*Spinbox.background", PALETTE["surface_alt"])
-        except tk.TclError:
-            pass
-
-    def _place_window(self):
-        width, height = self.px(self.BASE_WIDTH), self.px(self.BASE_HEIGHT)
-        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width = max(self.px(720), min(width, screen_w - self.px(32)))
-        height = max(self.px(520), min(height, screen_h - self.px(64)))
-        x = max(0, (screen_w - width) // 2)
-        y = max(0, (screen_h - height) // 3)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self._update_minsize(screen_w, screen_h)
-
-    def _update_minsize(self, screen_w: int | None = None, screen_h: int | None = None):
-        width_screen = int(screen_w) if screen_w is not None else self.root.winfo_screenwidth()
-        height_screen = int(screen_h) if screen_h is not None else self.root.winfo_screenheight()
-        self.root.minsize(
-            min(self.px(self.BASE_MIN_WIDTH), int(width_screen * 0.9)),
-            min(self.px(self.BASE_MIN_HEIGHT), int(height_screen * 0.85)),
-        )
-
-    def _watch_dpi(self):
-        if self._closing:
-            return
-        try:
-            dpi = window_dpi(self.root)
-        except tk.TclError:
-            return
-        if dpi != self.dpi:
-            self._apply_dpi(dpi)
-        try:
-            self._dpi_after = self.root.after(1500, self._watch_dpi)
-        except tk.TclError:
-            pass
-
-    def _apply_dpi(self, dpi: int):
-        self.dpi = int(dpi)
-        self.scale = max(1.0, self.dpi / 96.0)
-        self.root.tk.call("tk", "scaling", self.dpi / 72.0)
-        self._rebuild_ui()
-
-    def _rebuild_ui(self):
-        """DPI 变化时按新缩放重建整套界面，同时保留播放位置与日志。"""
-        position = self.position_var.get() if self.video_capture is not None else None
-        log_content = ""
-        if getattr(self, "log_text", None) is not None:
-            try:
-                log_content = self.log_text.get("1.0", "end-1c")
-            except tk.TclError:
-                log_content = ""
-        self._close_video()
-        for child in self.root.winfo_children():
-            if isinstance(child, tk.Toplevel):
-                continue
-            child.destroy()
-        self._apply_theme()
-        self._build()
-        self._update_minsize()
-        if log_content:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("1.0", log_content)
-            self.log_text.configure(state="disabled")
-            self.log_text.see("end")
-        if self.media_path is not None and position is not None:
-            has_video = any(stream.get("codec_type") == "video"
-                            for stream in (self.media_info.get("streams") or []))
-            self._open_video(self.media_path, has_video)
-            if self.video_capture is not None:
-                self._seek_video(str(position))
-
-    def _restore_action_states(self):
-        self._set_busy(self.busy)
-        self.cancel_translate_button.configure(
-            state="normal" if self.translate_running else "disabled")
-        if not self.translate_running:
-            self._update_translate_hint()
-
-    def _register_drop_targets(self):
-        if DND_FILES is None:
-            return
-        register = getattr(self.root, "drop_target_register", None)
-        bind = getattr(self.root, "dnd_bind", None)
-        if not (callable(register) and callable(bind)):
-            return
-        try:
-            register(DND_FILES)
-            bind("<<Drop>>", self._drop_media)
-            bind("<<DropEnter>>", lambda _event: self._set_drop_hover(True))
-            bind("<<DropLeave>>", lambda _event: self._set_drop_hover(False))
-        except tk.TclError:
-            pass
-
-    def _set_drop_hover(self, active: bool):
-        label = getattr(self, "drop_label", None)
-        if label is None:
-            return
-        try:
-            label.configure(bg=PALETTE["drop_hover"] if active else PALETTE["drop_idle"])
-        except tk.TclError:
-            pass
-
-    def _build(self):
-        root = self.root
-        root.configure(background=PALETTE["bg"])
-
-        header = ttk.Frame(root, style="Header.TFrame",
-                           padding=(self.px(18), self.px(14), self.px(18), self.px(6)))
-        header.pack(fill="x")
-        title_block = ttk.Frame(header, style="Header.TFrame")
-        title_block.pack(side="left")
-        ttk.Label(title_block, text="字幕工作台", style="HeaderTitle.TLabel").pack(anchor="w")
-        ttk.Label(title_block, text="本地 Whisper 识别 · AI 并发翻译 · 字幕轨无损封装",
-              style="HeaderSubtitle.TLabel").pack(anchor="w", pady=(self.px(2), 0))
-        actions = ttk.Frame(header, style="Header.TFrame")
-        actions.pack(side="right")
-        self.load_subtitle_button = ttk.Button(actions, text="载入字幕…",
-                                               command=self._choose_subtitle_file)
-        self.load_subtitle_button.pack(side="right")
-        self.choose_button = ttk.Button(actions, text="选择媒体…", style="Accent.TButton",
-                                        command=self._choose_media)
-        self.choose_button.pack(side="right", padx=(0, self.px(10)))
-        tk.Frame(root, height=self.px(2), bg=PALETTE["accent"],
-                  highlightthickness=0).pack(fill="x", padx=self.px(18),
-                                        pady=(0, self.px(8)))
-
-        tk.Frame(root, height=self.px(1), bg=PALETTE["border"],
-                 highlightthickness=0).pack(fill="x", padx=self.px(18), pady=(0, self.px(6)))
-
-        self.drop_label = tk.Label(
-            root,
-            text="拖入视频 / 音频 / 字幕文件 —— 支持一次拖入「媒体 + 同名字幕」，字幕也可单独拖入替换",
-            anchor="center", bg=PALETTE["drop_idle"], fg=PALETTE["drop_text"],
-            font=self.fonts["base"], padx=self.px(14), pady=self.px(8),
-            highlightthickness=0)
-        self.drop_label.pack(fill="x", padx=self.px(18), pady=(0, self.px(8)))
-        self._register_drop_targets()
-        root.bind("<space>", self._on_space)
-
-        self.path_label = ttk.Label(root, textvariable=self.path_var, style="Subtitle.TLabel",
-                                    anchor="w",
-                                    padding=(self.px(20), 0, self.px(20), self.px(4)))
-        self.path_label.pack(fill="x")
-
-        body = ttk.Panedwindow(root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=self.px(18), pady=(0, self.px(10)))
-        left = ttk.Frame(body, style="Panel.TFrame", padding=self.px(0))
-        right = ttk.Frame(body, style="Panel.TFrame", padding=self.px(0))
-        body.add(left, weight=4)
-        body.add(right, weight=3)
-
-        preview_shell = tk.Frame(left, bg=PALETTE["preview_stage"],
-                                 highlightbackground=PALETTE["border"],
-                                 highlightthickness=1, bd=0)
-        preview_shell.pack(fill="both", expand=True, padx=self.px(10), pady=(self.px(10), 0))
-        self.preview_stage = ttk.Frame(preview_shell, style="PreviewStage.TFrame")
-        self.preview_stage.pack(fill="both", expand=True, padx=self.px(1), pady=self.px(1))
-        self.preview_canvas = tk.Canvas(
-            self.preview_stage, bg=PALETTE["preview"], highlightthickness=0,
-            width=self.px(640), height=self.px(360))
-        self.preview_canvas.pack(anchor="center")
-        self.preview_stage.bind("<Configure>", self._resize_video_canvas)
-        self.preview_canvas.bind("<Configure>", self._resize_video_canvas)
-        self._draw_preview_placeholder("拖入媒体后在此预览画面\n播放时字幕会实时叠加（不会烧录）")
-
-        transport = ttk.Frame(left, style="Panel.TFrame",
-                              padding=(self.px(10), self.px(8), self.px(10), self.px(2)))
-        transport.pack(fill="x")
-        self.play_button = ttk.Button(transport, text="▶ 播放", style="Accent.TButton",
-                                      command=self._toggle_playback, state="disabled")
-        self.play_button.pack(side="left")
-        self.prev_button = ttk.Button(transport, text="⏮", width=3,
-                                      command=lambda: self._jump_entry(-1), state="disabled")
-        self.prev_button.pack(side="left", padx=(self.px(6), 0))
-        self.next_button = ttk.Button(transport, text="⏭", width=3,
-                                      command=lambda: self._jump_entry(1), state="disabled")
-        self.next_button.pack(side="left", padx=(self.px(3), 0))
-        self.seek_scale = ttk.Scale(transport, from_=0, to=1, variable=self.position_var,
-                                    command=self._seek_video, state="disabled")
-        self.seek_scale.pack(side="left", fill="x", expand=True, padx=self.px(8))
-        ttk.Label(transport, textvariable=self.time_label_var, style="SurfaceMuted.TLabel",
-                  width=13, anchor="e").pack(side="right")
-        self.sync_spinbox = ttk.Spinbox(transport, from_=-1.0, to=1.0, increment=0.05,
-                                        width=6, textvariable=self.sync_offset_var)
-        self.sync_spinbox.pack(side="right", padx=(self.px(6), 0))
-        ttk.Label(transport, text="同步", style="SurfaceMuted.TLabel").pack(
-            side="right", padx=(self.px(6), 0))
-        ttk.Label(left, textvariable=self.caption_var, style="SurfaceMuted.TLabel",
-                  justify="left", wraplength=self.px(680)).pack(
-            fill="x", padx=self.px(12), pady=(self.px(4), self.px(10)))
-
-        right_shell = tk.Frame(right, bg=PALETTE["surface"],
-                              highlightbackground=PALETTE["border"],
-                              highlightthickness=1, bd=0)
-        right_shell.pack(fill="both", expand=True, padx=self.px(10), pady=self.px(10))
-        self.notebook = ttk.Notebook(right_shell)
-        self.notebook.pack(fill="both", expand=True, padx=self.px(1), pady=self.px(1))
-        media_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
-        asr_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
-        self.notebook.add(media_tab, text="媒体与字幕")
-        self.notebook.add(asr_tab, text="识别")
-
-        # ---- 媒体与字幕 ----
-        ttk.Label(media_tab, textvariable=self.media_stats_var, style="SurfaceMuted.TLabel",
-                  justify="left", wraplength=self.px(360)).pack(anchor="w")
-        ttk.Label(media_tab, text="音轨", style="Section.TLabel").pack(
-            anchor="w", pady=(self.px(10), 0))
-        self.audio_box = ttk.Combobox(media_tab, state="readonly", values=["未检测到音轨"])
-        self.audio_box.pack(fill="x", pady=(self.px(4), 0))
-        self.audio_box.bind("<<ComboboxSelected>>", self._remember_audio_selection)
-        ttk.Label(media_tab, text="字幕来源", style="Section.TLabel").pack(
-            anchor="w", pady=(self.px(10), 0))
-        self.subtitle_box = ttk.Combobox(media_tab, state="readonly", values=["不使用字幕"])
-        self.subtitle_box.pack(fill="x", pady=(self.px(4), 0))
-        self.subtitle_box.bind("<<ComboboxSelected>>", self._select_subtitle)
-        list_head = ttk.Frame(media_tab, style="Panel.TFrame")
-        list_head.pack(fill="x", pady=(self.px(12), self.px(4)))
-        ttk.Label(list_head, text="字幕条目", style="Section.TLabel").pack(side="left")
-        ttk.Label(list_head, textvariable=self.entry_stats_var,
-                  style="SurfaceMuted.TLabel").pack(side="right")
-        tree_wrap = ttk.Frame(media_tab, style="Panel.TFrame")
-        tree_wrap.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(tree_wrap, columns=("index", "time", "text"),
-                                 show="headings", selectmode="browse")
-        self.tree.heading("index", text="#")
-        self.tree.heading("time", text="开始")
-        self.tree.heading("text", text="字幕文本")
-        self.tree.column("index", width=self.px(42), stretch=False, anchor="center")
-        self.tree.column("time", width=self.px(88), stretch=False, anchor="center")
-        self.tree.column("text", width=self.px(230))
-        tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        tree_scroll.pack(side="right", fill="y")
-        self.tree.tag_configure("odd", background=PALETTE["surface_alt"])
-        self.tree.tag_configure("even", background=PALETTE["surface"])
-        self.tree.bind("<<TreeviewSelect>>", self._select_entry)
-
-        # ---- 识别 ----
-        ttk.Label(asr_tab, text="Whisper 模型", style="Section.TLabel").pack(anchor="w")
-        asr_model_row = ttk.Frame(asr_tab, style="Panel.TFrame")
-        asr_model_row.pack(fill="x", pady=(self.px(4), 0))
-        ttk.Combobox(asr_model_row, textvariable=self.whisper_model_var, state="readonly",
-                     values=WHISPER_MODELS, width=14).pack(side="left")
-        linked = "、".join(cached_whisper_models()) or "无"
-        ttk.Label(asr_model_row, text=f"已缓存：{linked}", style="SurfaceMuted.TLabel").pack(
-            side="left", padx=(self.px(10), 0))
-        ttk.Label(asr_tab, text="音频语言（Whisper 提示，可自动检测）",
-                  style="Section.TLabel").pack(anchor="w", pady=(self.px(12), 0))
-        ttk.Combobox(asr_tab, textvariable=self.asr_language_var, state="readonly",
-                     values=list(LANGUAGES)).pack(fill="x", pady=(self.px(4), 0))
-        ttk.Label(asr_tab, text="未缓存的模型首次使用需要联网下载权重；识别推理在本机完成。",
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(360)).pack(anchor="w", pady=(self.px(12), 0))
-        asr_actions = ttk.Frame(asr_tab, style="Panel.TFrame")
-        asr_actions.pack(fill="x", side="bottom")
-        self.asr_status_label = ttk.Label(asr_actions, textvariable=self.asr_status_var,
-                                          style="SurfaceMuted.TLabel", justify="left",
-                                          wraplength=self.px(170))
-        self.asr_status_label.pack(side="left", fill="x", expand=True)
-        self.asr_button = ttk.Button(asr_actions, text="识别所选音轨", style="Accent.TButton",
-                                     command=self._start_transcription)
-        self.asr_button.pack(side="right")
-        self.plan_asr_button = ttk.Button(asr_actions, text="加入计划",
-                                          command=self._plan_add_asr)
-        self.plan_asr_button.pack(side="right", padx=(0, self.px(6)))
-
-        # ---- 翻译 ----
-        translate_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
-        self.notebook.add(translate_tab, text="翻译")
-
-        ttk.Label(translate_tab, text="翻译模型", style="Section.TLabel").pack(anchor="w")
-        self.translation_model_box = ttk.Combobox(
-            translate_tab, textvariable=self.translation_model_var, state="readonly",
-            values=[item["name"] for item in translation_models()])
-        self.translation_model_box.pack(fill="x", pady=(self.px(4), 0))
-        self.translation_model_box.bind("<<ComboboxSelected>>",
-                                       self._on_translation_model_change)
-        ttk.Label(translate_tab, textvariable=self.model_detail_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(360)).pack(anchor="w", pady=(self.px(4), 0))
-
-        concurrency_row = ttk.Frame(translate_tab, style="Panel.TFrame")
-        concurrency_row.pack(fill="x", pady=(self.px(10), 0))
-        ttk.Label(concurrency_row, text="并发请求数", style="Section.TLabel").pack(side="left")
-        self.concurrency_spinbox = ttk.Spinbox(
-            concurrency_row, from_=1, to=self.MAX_CONCURRENT, width=6,
-            textvariable=self.translation_concurrency_var)
-        self.concurrency_spinbox.pack(side="left", padx=self.px(8))
-        ttk.Label(concurrency_row, text="1–100 · 受 API 限额约束",
-                  style="SurfaceMuted.TLabel").pack(side="left")
-
-        group_row = ttk.Frame(translate_tab, style="Panel.TFrame")
-        group_row.pack(fill="x", pady=(self.px(10), 0))
-        self.group_check = ttk.Checkbutton(
-            group_row, text="分组翻译", variable=self.group_translation_var,
-            command=self._toggle_group_translation)
-        self.group_check.pack(side="left")
-        ttk.Label(group_row, text="每组行数", style="SurfaceMuted.TLabel").pack(
-            side="left", padx=(self.px(12), self.px(4)))
-        self.batch_size_spinbox = ttk.Spinbox(
-            group_row, from_=subtitles.BATCH_SIZE_MIN, to=subtitles.BATCH_SIZE_MAX,
-            textvariable=self.batch_size_var, width=5, state="disabled")
-        self.batch_size_spinbox.pack(side="left")
-        ttk.Label(group_row, text=f"（{subtitles.BATCH_SIZE_MIN}–{subtitles.BATCH_SIZE_MAX} 行）",
-                  style="SurfaceMuted.TLabel").pack(side="left", padx=(self.px(4), 0))
-        ttk.Label(translate_tab,
-                  text="逐条对齐更严格；分组把多行合并成一次请求，请求数更少。",
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(520)).pack(anchor="w", pady=(self.px(2), 0))
-
-        lang_grid = ttk.Frame(translate_tab, style="Panel.TFrame")
-        lang_grid.pack(fill="x", pady=(self.px(12), 0))
-        lang_grid.columnconfigure(1, weight=1)
-        ttk.Label(lang_grid, text="源语言", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=self.px(2))
-        self.source_language_box = ttk.Combobox(
-            lang_grid, textvariable=self.source_var, state="readonly",
-            values=self._translation_language_options(include_auto=True))
-        self.source_language_box.grid(row=0, column=1, sticky="ew",
-                                      padx=self.px(8), pady=self.px(2))
-        self.source_language_box.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self._select_custom_language(
-                self.source_var, self.source_language_box, "source"))
-        ttk.Label(lang_grid, text="目标语言", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=self.px(2))
-        self.target_language_box = ttk.Combobox(
-            lang_grid, textvariable=self.target_var, state="readonly",
-            values=self._translation_language_options(include_auto=False))
-        self.target_language_box.grid(row=1, column=1, sticky="ew",
-                                      padx=self.px(8), pady=self.px(2))
-        self.target_language_box.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self._select_custom_language(
-                self.target_var, self.target_language_box, "target"))
-        ttk.Label(lang_grid, text="翻译来源", style="Surface.TLabel").grid(
-            row=2, column=0, sticky="w", pady=self.px(2))
-        translate_source_box = ttk.Combobox(lang_grid, textvariable=self.translate_source_var,
-                                            state="readonly", values=list(TRANSLATE_SOURCES))
-        translate_source_box.grid(row=2, column=1, sticky="ew", padx=self.px(8),
-                                  pady=self.px(2))
-        translate_source_box.bind("<<ComboboxSelected>>",
-                                  lambda _event: self._on_translate_source_change())
-        ttk.Label(translate_tab, textvariable=self.translate_source_hint_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(520)).pack(anchor="w", pady=(self.px(4), 0))
-
-        context_row = ttk.Frame(translate_tab, style="Panel.TFrame")
-        context_row.pack(fill="x", pady=(self.px(8), 0))
-        ttk.Label(context_row, text="上下文句数", style="Section.TLabel").pack(side="left")
-        self.context_spinbox = ttk.Spinbox(
-            context_row, from_=0, to=CONTEXT_LINES_MAX, width=5,
-            textvariable=self.context_lines_var)
-        self.context_spinbox.pack(side="left", padx=self.px(8))
-        ttk.Label(context_row, text=f"前后各 N 条非空字幕只作参考（0–{CONTEXT_LINES_MAX}，0 = 关闭）",
-                  style="SurfaceMuted.TLabel").pack(side="left")
-
-        plan_row = ttk.Frame(translate_tab, style="Panel.TFrame")
-        plan_row.pack(fill="x", pady=(self.px(8), 0))
-        ttk.Label(plan_row, text="把当前翻译设置记入计划：",
-                  style="SurfaceMuted.TLabel").pack(side="left")
-        self.plan_translate_button = ttk.Button(plan_row, text="加入计划",
-                                                command=self._plan_add_translate)
-        self.plan_translate_button.pack(side="right")
-
-        self.translate_progress = ttk.Progressbar(translate_tab, mode="determinate",
-                                                  maximum=1, value=0)
-        self.translate_progress.pack(fill="x", pady=(self.px(12), 0))
-        progress_row = ttk.Frame(translate_tab, style="Panel.TFrame")
-        progress_row.pack(fill="x", pady=(self.px(6), 0))
-        ttk.Label(progress_row, textvariable=self.translate_progress_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(200)).pack(side="left", fill="x", expand=True)
-        self.cancel_translate_button = ttk.Button(progress_row, text="取消翻译",
-                                                  command=self._cancel_translation,
-                                                  state="disabled")
-        self.cancel_translate_button.pack(side="right")
-        self.translate_button = ttk.Button(progress_row, text="开始翻译", style="Accent.TButton",
-                                           command=self._start_translation)
-        self.translate_button.pack(side="right", padx=(0, self.px(8)))
-
-        log_head = ttk.Frame(translate_tab, style="Panel.TFrame")
-        log_head.pack(fill="x", pady=(self.px(12), self.px(4)))
-        ttk.Label(log_head, text="运行日志（批次进度 / 降级 / 错误）",
-                  style="Section.TLabel").pack(side="left")
-        ttk.Button(log_head, text="清空", style="Ghost.TButton",
-                   command=self._clear_log).pack(side="right")
-        log_wrap = ttk.Frame(translate_tab, style="Panel.TFrame")
-        log_wrap.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_wrap, height=5, wrap="word", font=self.fonts["mono"],
-                                bg=PALETTE["surface_alt"], fg=PALETTE["ink"], bd=0,
-                                highlightthickness=1,
-                                highlightbackground=PALETTE["border"],
-                                state="disabled", padx=self.px(6), pady=self.px(4))
-        log_scroll = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
-
-        # ---- 导出与封装（两大块：① 只导出单个字幕文件；② 只管压制字幕，互不影响）----
-        export_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
-        self.notebook.add(export_tab, text="导出与封装")
-        export_modes = ttk.Notebook(export_tab)
-        export_modes.pack(fill="both", expand=True)
-        file_export_tab = ttk.Frame(export_modes, style="Panel.TFrame", padding=self.px(12))
-        mux_tab = ttk.Frame(export_modes, style="Panel.TFrame", padding=self.px(12))
-        export_modes.add(file_export_tab, text="字幕文件导出")
-        export_modes.add(mux_tab, text="字幕轨压制")
-
-        ttk.Label(file_export_tab, text="导出独立字幕文件",
-                  style="Section.TLabel").pack(anchor="w")
-        file_grid = ttk.Frame(file_export_tab, style="Panel.TFrame")
-        file_grid.pack(fill="x", pady=(self.px(4), 0))
-        file_grid.columnconfigure(1, weight=1)
-        ttk.Label(file_grid, text="字幕格式", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=self.px(3))
-        self.export_format_box = ttk.Combobox(file_grid,
-                                              textvariable=self.subtitle_format_var,
-                                              state="readonly", values=("SRT", "ASS", "VTT"))
-        self.export_format_box.grid(row=0, column=1, sticky="ew", padx=self.px(8),
-                                    pady=self.px(3))
-        self.export_format_box.bind("<<ComboboxSelected>>",
-                                    lambda _event: self._update_export_file_hint())
-        ttk.Label(file_grid, text="字幕语言", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=self.px(3))
-        self.subtitle_language_box = ttk.Combobox(file_grid,
-                                                  textvariable=self.subtitle_language_var,
-                                                  state="readonly",
-                                                  values=("原文", "译文", "双语"))
-        self.subtitle_language_box.grid(row=1, column=1, sticky="ew", padx=self.px(8),
-                                        pady=self.px(3))
-        self.subtitle_language_box.bind("<<ComboboxSelected>>",
-                                        self._on_subtitle_language_change)
-        ttk.Label(file_export_tab, textvariable=self.export_file_hint_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(520)).pack(anchor="w", pady=(self.px(4), 0))
-        file_actions = ttk.Frame(file_export_tab, style="Panel.TFrame")
-        file_actions.pack(fill="x", pady=(self.px(4), 0))
-        self.export_button = ttk.Button(file_actions, text="导出当前文件",
-                                        command=self._start_export)
-        self.export_button.pack(side="left")
-        self.plan_export_button = ttk.Button(file_actions, text="加入计划：导出字幕",
-                                             command=self._plan_add_export)
-        self.plan_export_button.pack(side="left", padx=(self.px(6), 0))
-
-        ttk.Label(mux_tab, text="将字幕封装为独立轨道，不会烧录到画面",
-                  style="Section.TLabel").pack(anchor="w", pady=(self.px(6), 0))
-        track_row = ttk.Frame(mux_tab, style="Panel.TFrame")
-        track_row.pack(fill="x", pady=(self.px(4), 0))
-        track_row.columnconfigure(0, weight=1)
-        self.mux_track_kind_box = ttk.Combobox(track_row,
-                                              textvariable=self.mux_track_kind_var,
-                                              state="readonly", values=MUX_TRACK_KINDS)
-        self.mux_track_kind_box.grid(row=0, column=0, sticky="ew")
-        self.mux_track_kind_box.bind("<<ComboboxSelected>>", self._on_mux_track_kind)
-        self.mux_track_add_button = ttk.Button(track_row, text="添加", style="Ghost.TButton",
-                                               command=self._add_mux_track)
-        self.mux_track_add_button.grid(row=0, column=1, padx=(self.px(6), 0))
-        mux_tracks_wrap = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_tracks_wrap.pack(fill="x", pady=(self.px(6), 0))
-        self.mux_tracks_tree = ttk.Treeview(mux_tracks_wrap,
-                                            columns=("order", "label", "language"),
-                                            show="headings", selectmode="browse", height=5)
-        self.mux_tracks_tree.heading("order", text="#")
-        self.mux_tracks_tree.heading("label", text="要压制的字幕轨")
-        self.mux_tracks_tree.heading("language", text="语言")
-        self.mux_tracks_tree.column("order", width=self.px(36), stretch=False,
-                                    anchor="center")
-        self.mux_tracks_tree.column("label", width=self.px(228))
-        self.mux_tracks_tree.column("language", width=self.px(70), stretch=False)
-        self.mux_tracks_tree.tag_configure("first", foreground=PALETTE["accent"])
-        mux_tracks_scroll = ttk.Scrollbar(mux_tracks_wrap, orient="vertical",
-                                          command=self.mux_tracks_tree.yview)
-        self.mux_tracks_tree.configure(yscrollcommand=mux_tracks_scroll.set)
-        self.mux_tracks_tree.pack(side="left", fill="both", expand=True)
-        mux_tracks_scroll.pack(side="right", fill="y")
-        mux_track_actions = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_track_actions.pack(fill="x", pady=(self.px(2), 0))
-        for text, command in (("移除", self._remove_mux_track),
-                              ("设为默认", self._set_default_mux_track),
-                              ("清空", self._clear_mux_tracks)):
-            ttk.Button(mux_track_actions, text=text, style="Ghost.TButton",
-                       command=command).pack(side="left", padx=(0, self.px(6)))
-        ttk.Label(mux_tab, textvariable=self.export_hint_var, style="SurfaceMuted.TLabel",
-                  justify="left", wraplength=self.px(520)).pack(
-            anchor="w", pady=(self.px(4), 0))
-        mux_check_row = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_check_row.pack(fill="x", pady=(self.px(4), 0))
-        self.mux_check = ttk.Checkbutton(
-            mux_check_row, text="压制前检查重复字幕（同语言且内容雷同才算重复）",
-            variable=self.mux_check_var, command=self._update_mux_hint)
-        self.mux_check.pack(side="left")
-        ttk.Label(mux_check_row, text="本地阈值", style="SurfaceMuted.TLabel").pack(
-            side="left", padx=(self.px(10), self.px(4)))
-        self.mux_threshold_spinbox = ttk.Spinbox(
-            mux_check_row, from_=DUPLICATE_AI_LOW, to=100, width=5,
-            textvariable=self.mux_threshold_var, command=self._update_mux_hint)
-        self.mux_threshold_spinbox.pack(side="left")
-        ttk.Label(mux_check_row, text=f"%（{DUPLICATE_AI_LOW}–阈值交 AI 判语义）",
-                  style="SurfaceMuted.TLabel").pack(side="left", padx=(self.px(4), 0))
-        mux_subs_head = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_subs_head.pack(fill="x", pady=(self.px(8), self.px(2)))
-        ttk.Button(mux_subs_head, text="全部删除", style="Ghost.TButton",
-                   command=lambda: self._set_all_mux_subs(False)).pack(side="right")
-        ttk.Button(mux_subs_head, text="全部保留", style="Ghost.TButton",
-                   command=lambda: self._set_all_mux_subs(True)).pack(
-            side="right", padx=(0, self.px(6)))
-        ttk.Label(mux_subs_head, text="原有内嵌字幕", style="Section.TLabel").pack(side="left")
-        ttk.Label(mux_tab, text="勾选 = 保留；取消勾选 = 压制时删除该字幕轨",
-              style="SurfaceMuted.TLabel").pack(anchor="w", pady=(0, self.px(2)))
-        # 字幕轨很多时限高滚动，避免把导出页撑高（三个按钮 / 下拉框仍始终可见）
-        mux_subs_wrap = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_subs_wrap.pack(fill="x")
-        self.mux_subs_canvas = tk.Canvas(mux_subs_wrap, bg=PALETTE["surface"],
-                                        highlightthickness=0, bd=0,
-                                        height=self.px(48))
-        mux_subs_scroll = ttk.Scrollbar(mux_subs_wrap, orient="vertical",
-                                        command=self.mux_subs_canvas.yview)
-        self.mux_subs_canvas.configure(yscrollcommand=mux_subs_scroll.set)
-        self.mux_subs_canvas.pack(side="left", fill="x", expand=False)
-        mux_subs_scroll.pack(side="right", fill="y")
-        self.mux_subs_frame = ttk.Frame(self.mux_subs_canvas, style="Panel.TFrame")
-        self._mux_subs_window = self.mux_subs_canvas.create_window(
-            (0, 0), window=self.mux_subs_frame, anchor="nw")
-        self.mux_subs_frame.bind(
-            "<Configure>",
-            lambda _event: self.mux_subs_canvas.configure(
-                scrollregion=self.mux_subs_canvas.bbox("all")))
-        self.mux_subs_canvas.bind(
-            "<Configure>",
-            lambda event: self.mux_subs_canvas.itemconfigure(self._mux_subs_window,
-                                                            width=event.width))
-        for widget in (self.mux_subs_canvas, self.mux_subs_frame):
-            widget.bind("<MouseWheel>", self._on_mux_subs_wheel)
-
-        mux_actions = ttk.Frame(mux_tab, style="Panel.TFrame")
-        mux_actions.pack(fill="x", pady=(self.px(8), 0))
-        self.mux_button = ttk.Button(mux_actions, text="压制当前文件",
-                                     style="Accent.TButton", command=self._start_mux)
-        self.mux_button.pack(side="left")
-        self.plan_mux_button = ttk.Button(mux_actions, text="加入计划：压制字幕",
-                                          command=self._plan_add_mux)
-        self.plan_mux_button.pack(side="left", padx=(self.px(6), 0))
-
-        # ---- 计划任务 ----
-        plan_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=self.px(12))
-        self.notebook.add(plan_tab, text="计划任务")
-        # 按钮先占住底部（否则内容变高时会被挤到可视区外）
-        plan_actions = ttk.Frame(plan_tab, style="Panel.TFrame")
-        plan_actions.pack(fill="x", side="bottom")
-        self.plan_stop_button = ttk.Button(plan_actions, text="停止",
-                                          command=self._stop_plan, state="disabled")
-        self.plan_stop_button.pack(side="right", padx=(0, self.px(6)))
-        self.plan_button = ttk.Button(plan_actions, text="开始执行计划",
-                                      style="Accent.TButton", command=self._start_plan)
-        self.plan_button.pack(side="right")
-        ttk.Label(plan_tab, text="已加入的计划步骤（按顺序执行）",
-                  style="Section.TLabel").pack(anchor="w")
-        steps_head = ttk.Frame(plan_tab, style="Panel.TFrame")
-        steps_head.pack(fill="x", pady=(self.px(4), self.px(4)))
-        self.plan_step_buttons = []
-        for text, command in (("清空", self._plan_clear_steps),
-                              ("删除", self._plan_remove_step),
-                              ("下移", lambda: self._plan_move_step(1)),
-                              ("上移", lambda: self._plan_move_step(-1))):
-            button = ttk.Button(steps_head, text=text, style="Ghost.TButton",
-                                command=command)
-            button.pack(side="right", padx=(self.px(4), 0))
-            self.plan_step_buttons.append(button)
-        steps_wrap = ttk.Frame(plan_tab, style="Panel.TFrame")
-        steps_wrap.pack(fill="both", expand=True)
-        self.plan_tree = ttk.Treeview(steps_wrap, columns=("order", "page", "detail"),
-                                     show="headings", selectmode="browse", height=3)
-        self.plan_tree.heading("order", text="#")
-        self.plan_tree.heading("page", text="页面")
-        self.plan_tree.heading("detail", text="设置")
-        self.plan_tree.column("order", width=self.px(34), stretch=False, anchor="center")
-        self.plan_tree.column("page", width=self.px(78), stretch=False, anchor="center")
-        self.plan_tree.column("detail", width=self.px(240))
-        steps_scroll = ttk.Scrollbar(steps_wrap, orient="vertical",
-                                     command=self.plan_tree.yview)
-        self.plan_tree.configure(yscrollcommand=steps_scroll.set)
-        self.plan_tree.pack(side="left", fill="both", expand=True)
-        steps_scroll.pack(side="right", fill="y")
-        self.plan_tree.tag_configure("odd", background=PALETTE["surface_alt"])
-        self.plan_tree.tag_configure("even", background=PALETTE["surface"])
-
-        ttk.Label(plan_tab, text="要处理的文件（可多选，逐个执行整套计划）",
-                  style="Section.TLabel").pack(anchor="w", pady=(self.px(8), 0))
-        files_head = ttk.Frame(plan_tab, style="Panel.TFrame")
-        files_head.pack(fill="x", pady=(self.px(4), self.px(4)))
-        self.plan_file_buttons = []
-        for text, command in (("清空", self._plan_clear_files),
-                              ("移除", self._plan_remove_file),
-                              ("添加当前媒体", self._plan_add_current),
-                              ("添加文件…", self._plan_choose_files)):
-            button = ttk.Button(files_head, text=text, style="Ghost.TButton",
-                                command=command)
-            button.pack(side="right", padx=(self.px(4), 0))
-            self.plan_file_buttons.append(button)
-        files_wrap = ttk.Frame(plan_tab, style="Panel.TFrame")
-        files_wrap.pack(fill="both", expand=True)
-        self.plan_files_tree = ttk.Treeview(files_wrap,
-                                            columns=("order", "name", "status", "tokens"),
-                                            show="headings", selectmode="browse", height=5)
-        self.plan_files_tree.heading("order", text="#")
-        self.plan_files_tree.heading("name", text="文件 / 步骤")
-        self.plan_files_tree.heading("status", text="状态")
-        self.plan_files_tree.heading("tokens", text="Token")
-        self.plan_files_tree.column("order", width=self.px(46), stretch=False,
-                                    anchor="center")
-        self.plan_files_tree.column("name", width=self.px(170))
-        self.plan_files_tree.column("status", width=self.px(120), stretch=False)
-        self.plan_files_tree.column("tokens", width=self.px(72), stretch=False,
-                                    anchor="e")
-        files_scroll = ttk.Scrollbar(files_wrap, orient="vertical",
-                                     command=self.plan_files_tree.yview)
-        self.plan_files_tree.configure(yscrollcommand=files_scroll.set)
-        self.plan_files_tree.pack(side="left", fill="both", expand=True)
-        files_scroll.pack(side="right", fill="y")
-        self.plan_files_tree.tag_configure("running", background=PALETTE["accent_soft"])
-        self.plan_files_tree.tag_configure("done", background=PALETTE["done"])
-        self.plan_files_tree.tag_configure("failed", background=PALETTE["failed"])
-        self.plan_files_tree.tag_configure("skipped", background=PALETTE["skipped"])
-        self.plan_files_tree.tag_configure("step", foreground=PALETTE["muted"])
-
-        plan_options = ttk.Frame(plan_tab, style="Panel.TFrame")
-        plan_options.pack(fill="x", pady=(self.px(8), 0))
-        self.plan_continue_check = ttk.Checkbutton(
-            plan_options, text="某个文件失败后继续处理下一个",
-            variable=self.plan_continue_var)
-        self.plan_continue_check.pack(side="left")
-
-        self.plan_progress = ttk.Progressbar(plan_tab, mode="determinate",
-                                            maximum=1, value=0)
-        self.plan_progress.pack(fill="x", pady=(self.px(8), 0))
-        ttk.Label(plan_tab, textvariable=self.plan_progress_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(340)).pack(anchor="w", pady=(self.px(2), 0))
-        self.plan_step_progress = ttk.Progressbar(plan_tab, mode="determinate",
-                                                  maximum=1, value=0)
-        self.plan_step_progress.pack(fill="x", pady=(self.px(6), 0))
-        ttk.Label(plan_tab, textvariable=self.plan_status_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(340)).pack(anchor="w", pady=(self.px(2), 0))
-        ttk.Label(plan_tab, textvariable=self.plan_token_var,
-                  style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=self.px(340)).pack(anchor="w", pady=(self.px(2), 0))
-
-        # ---- 底栏 ----
-        footer = ttk.Frame(root, style="Header.TFrame",
-                           padding=(self.px(18), 0, self.px(18), self.px(10)))
-        footer.pack(fill="x")
-        self.footer_progress = ttk.Progressbar(footer, mode="indeterminate",
-                                               length=self.px(150))
-        self.footer_progress.pack(side="right")
-        ttk.Label(footer, textvariable=self.status_var, style="Subtitle.TLabel").pack(side="left")
-        if DND_FILES is None:
-            self.status_var.set("拖拽需安装 tkinterdnd2；仍可使用右上角按钮载入文件")
-
-        self._sync_from_state()
-        self._restore_action_states()
-
-    # ------------------------------------------------------------- 界面状态同步
-    def _selected_audio_ordinal(self) -> int:
-        """当前「音轨」下拉框对应的音频流序号（0 起）；未选或无音轨时返回 0。"""
-        if not self.audio_tracks:
-            return 0
-        try:
-            index = int(self.audio_box.current())
-        except (tk.TclError, ValueError):
-            index = 0
-        return max(0, min(index, len(self.audio_tracks) - 1))
-
-    def _remember_audio_selection(self, _event=None):
-        """记住音轨选择；正在播放时立即换到新音轨（重新起播音频时钟）。"""
-        self._audio_index = self._selected_audio_ordinal()
-        if not self.video_playing:
-            return
-        self._reset_play_clock(self.position_var.get())
-        self._start_audio(self.position_var.get())
-        self._append_log(f"已切换播放音轨：音轨 {self._audio_index + 1}")
-
-    def _subtitle_option_count(self) -> int:
-        """可选字幕来源数量（不含列表末端的「导入外部字幕文件…」占位项）。"""
-        return max(1, len(self._subtitle_options) - 1)
-
-    def _sync_from_state(self):
-        self.path_var.set(str(self.media_path) if self.media_path else "")
-        if self.audio_tracks:
-            self.audio_box["values"] = [item["label"] for item in self.audio_tracks]
-            self.audio_box.current(max(0, min(self._audio_index, len(self.audio_tracks) - 1)))
-        else:
-            self.audio_box["values"] = ["未检测到音轨"]
-            self.audio_box.set("未检测到音轨")
-        self.subtitle_box["values"] = list(self._subtitle_options)
-        self.subtitle_box.current(
-            max(0, min(self._subtitle_index, self._subtitle_option_count() - 1)))
-        self._refresh_plan_tree()
-        self._refresh_plan_files_tree()
-        self._populate_tree()
-        self._update_media_stats()
-        self._refresh_mux_embedded_subs()
-        self._refresh_mux_tracks_tree()
-        self._update_translate_source_hint()
-        self._refresh_translation_models()
-        self._update_export_hint()
-        self._update_entry_stats()
-
-    def _rebuild_subtitle_options(self, select: int = 0):
-        options = ["不使用字幕"]
-        options.extend(item["label"] for item in self.embedded_subtitles)
-        options.extend(f"外置字幕 · {path.name}" for path in self.external_subtitles)
-        options.append(SUBTITLE_IMPORT_ENTRY)        # 末尾固定为「导入外部字幕文件…」
-        self._subtitle_options = options
-        self.subtitle_box["values"] = options
-        index = max(0, min(select, self._subtitle_option_count() - 1))
-        self._subtitle_index = index
-        self.subtitle_box.current(index)
-
-    def _adopt_external_subtitle(self, path: Path):
-        if self.media_path is None:
-            messagebox.showinfo("需要媒体", "请先载入媒体文件，再载入字幕。")
-            return
-        path = path.expanduser()
-        if not path.is_file() or path.suffix.lower() not in SUBTITLE_EXTENSIONS:
-            messagebox.showerror("无法打开", f"不是有效的字幕文件：{path}")
-            return
-        if path not in self.external_subtitles:
-            self.external_subtitles.append(path)
-        index = 1 + len(self.embedded_subtitles) + self.external_subtitles.index(path)
-        self._rebuild_subtitle_options(select=index)
-        self._update_media_stats()
-        self._select_subtitle()
-        self.status_var.set(f"已载入外置字幕：{path.name}")
-
-    def _default_subtitle_dir(self) -> Path | None:
-        """导入字幕对话框的默认目录：优先媒体所在目录，其次已载入字幕的目录。"""
-        if self.media_path is not None:
-            parent = self.media_path.parent
-            if parent.is_dir():
-                return parent
-        for candidate in self.external_subtitles:
-            if candidate.parent.is_dir():
-                return candidate.parent
-        return None
-
-    def _choose_subtitle_file(self, restore_on_cancel: bool = False):
-        """选择字幕文件（默认目录 = 媒体所在目录）；从「字幕来源」进入时，取消则回到原选项。"""
-        options = {
-            "title": "选择字幕文件",
-            "filetypes": [("字幕文件", "*.srt *.ass *.ssa *.vtt *.sub *.smi"),
-                          ("所有文件", "*.*")],
-        }
-        folder = self._default_subtitle_dir()
-        if folder is not None:
-            options["initialdir"] = str(folder)
-        path = filedialog.askopenfilename(**options)
-        if not path:
-            if restore_on_cancel:
-                self._restore_subtitle_selection()
-            return
-        self._adopt_external_subtitle(Path(path))
-
-    def _restore_subtitle_selection(self):
-        index = max(0, min(self._subtitle_index, self._subtitle_option_count() - 1))
-        self._subtitle_index = index
-        self.subtitle_box.current(index)
-
-    def _append_log(self, text: str | None):
-        widget = getattr(self, "log_text", None)
-        if widget is None or not text:
-            return
-        widget.configure(state="normal")
-        widget.insert("end", str(text).rstrip() + "\n")
-        try:
-            lines = int(widget.index("end-1c").split(".")[0])
-            if lines > 400:
-                widget.delete("1.0", f"{lines - 320}.0")
-        except (tk.TclError, ValueError):
-            pass
-        widget.see("end")
-        widget.configure(state="disabled")
-
-    def _clear_log(self):
-        widget = getattr(self, "log_text", None)
-        if widget is None:
-            return
-        widget.configure(state="normal")
-        widget.delete("1.0", "end")
-        widget.configure(state="disabled")
-
-    def _on_space(self, _event=None):
-        """空格键播放/暂停；输入类控件获得焦点时不拦截。"""
-        try:
-            widget = self.root.focus_get()
-        except (tk.TclError, KeyError):
-            widget = None
-        if isinstance(widget, (tk.Entry, tk.Text, ttk.Entry)):
-            return None
-        if self.video_capture is None:
-            return None
-        self._toggle_playback()
-        return "break"
-
-    def _draw_preview_placeholder(self, message: str | None):
-        self._preview_message = message
-        canvas = getattr(self, "preview_canvas", None)
-        if canvas is None:
-            return
-        self._fit_preview_canvas()
-        canvas.delete("all")
-        if not message:
-            return
-        width = max(canvas.winfo_width(), self.px(240))
-        height = max(canvas.winfo_height(), self.px(160))
-        canvas.create_text(width // 2, height // 2, text=message,
-                           fill=PALETTE["preview_text"], font=self.fonts["base"],
-                           justify="center", width=width - self.px(40))
-
-    def _set_transport_enabled(self, enabled: bool):
-        state = "normal" if enabled else "disabled"
-        for widget in (self.play_button, self.prev_button, self.next_button):
-            widget.configure(state=state)
-        self.seek_scale.configure(state=state)
-
-    def _update_media_stats(self):
-        if self.media_path is None:
-            self.media_stats_var.set("拖入媒体文件后显示轨道信息。")
-            return
-        details = []
-        try:
-            details.append(f"{self.media_path.stat().st_size / 1_048_576:,.1f} MB")
-        except OSError:
-            pass
-        videos = [stream for stream in (self.media_info.get("streams") or [])
-                  if stream.get("codec_type") == "video"]
-        if videos:
-            width = videos[0].get("width") or "?"
-            height = videos[0].get("height") or "?"
-            rate = str(videos[0].get("avg_frame_rate") or "")
-            fps = None
-            if "/" in rate:
-                numerator, _, denominator = rate.partition("/")
-                try:
-                    denominator_value = float(denominator)
-                    fps = float(numerator) / denominator_value if denominator_value else None
-                except ValueError:
-                    fps = None
-            details.append(f"{width}×{height}" + (f" · {fps:.2f} fps" if fps else ""))
-        try:
-            duration = float((self.media_info.get("format") or {}).get("duration") or 0)
-            if duration > 0:
-                details.append(self._format_duration(duration))
-        except (TypeError, ValueError):
-            pass
-        summary = " · ".join(details)
-        self.media_stats_var.set(
-            f"文件：{self.media_path.name}\n{summary}\n"
-            f"{len(self.audio_tracks)} 音轨 · {len(self.embedded_subtitles)} 内嵌字幕 · "
-            f"{len(self.external_subtitles)} 外置字幕")
-
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        total = max(0, int(seconds))
-        return f"{total // 3600:02d}:{(total // 60) % 60:02d}:{total % 60:02d}"
-
-    @staticmethod
-    def _format_timestamp(milliseconds: float) -> str:
-        total = max(0, int(milliseconds)) // 1000
-        return f"{total // 3600:02d}:{(total // 60) % 60:02d}:{total % 60:02d}"
-
-    def _update_entry_stats(self):
-        count = len(self.entries)
-        if count:
-            filled = sum(1 for entry in self.entries if entry["text"].strip())
-            translated = sum(1 for entry in self.translated
-                             if entry.get("text", "").strip())
-            text = f"{count} 条 · 可翻译 {filled} 条"
-            if translated:
-                text += f" · 已翻译 {translated} 条"
-            self.entry_stats_var.set(text)
-        else:
-            self.entry_stats_var.set("0 条")
-        self._update_translate_hint()
-
-    def _update_translate_hint(self):
-        if self.busy or self.translate_running:
-            return
-        if not self.entries:
-            self.translate_progress_var.set("载入或识别字幕后即可开始翻译。")
-            return
-        filled = sum(1 for entry in (self.original_entries or self.entries)
-                     if entry["text"].strip())
-        mode = (f"分组 {self.batch_size_var.get()} 行/批"
-                if self.group_translation_var.get() else "逐条")
-        self.translate_progress_var.set(
-            f"待翻译 {filled} 条 · {mode} · 上下文 ±{self.context_lines_var.get()} 条 · "
-            f"并发 {self.translation_concurrency_var.get()}")
-
-    def _update_export_hint(self):
-        """同时刷新两块提示（单文件导出 / 压制）。"""
-        self._update_export_file_hint()
-        self._update_mux_hint()
-
-    def _update_export_file_hint(self):
-        """① 导出字幕文件：只写一个文件，与压制设置无关。"""
-        if self.media_path is None:
-            self.export_file_hint_var.set("载入媒体后显示预计输出文件名。")
-            return
-        mode = self.subtitle_language_var.get()
-        suffix = SUBTITLE_OUTPUT_SUFFIX.get(mode, "original")
-        name = f"{self.media_path.stem}_{suffix}.{self.subtitle_format_var.get().lower()}"
-        self.export_file_hint_var.set(f"将输出到媒体同目录：{name}")
-
-    def _update_mux_hint(self):
-        """② 压制字幕：写明要压几条轨 / 删除几条内嵌字幕 / 是否做重复检查。"""
-        self._refresh_mux_tracks_tree()
-        threshold = self._mux_threshold()
-        check_state = (f"压制前检查重复字幕：开（本地 ≥{threshold}%，不同语言不算重复）"
-                       if self.mux_check_var.get() else "压制前检查重复字幕：关")
-        if self.media_path is None:
-            self.export_hint_var.set(f"载入媒体后显示预计输出文件名。{check_state}")
-            return
-        has_video = any(stream.get("codec_type") == "video"
-                        for stream in (self.media_info.get("streams") or []))
-        container = ".mkv" if has_video else ".mka"
-        tracks = self._mux_tracks
-        if tracks:
-            labels = [self._mux_track_label(track) for track in tracks]
-            shown = "、".join(labels[:3]) + ("…" if len(labels) > 3 else "")
-            source = f"{len(labels)} 条字幕轨（{shown}）"
-        else:
-            source = f"生成的字幕（{self.subtitle_language_var.get()}）"
-        drop = len(self._selected_drop_subtitles())
-        extra = f"，删除 {drop} 条内嵌字幕" if drop else ""
-        bound = sum(1 for track in tracks
-                    if track.get("kind") == "external"
-                    and subtitle_binding(self.media_path, track.get("path") or ""))
-        bind_note = (f"{bound} 条外部字幕按文件名关系匹配（加入计划后自动换成各文件自己的字幕）；"
-                     if bound else "")
-        self.export_hint_var.set(
-            f"将压制 {source} → {self.media_path.stem}_subtitled{container}{extra}"
-            f"\n列表为空 = 按「字幕语言」压 1 条；第一条为默认轨。{bind_note}{check_state}")
-
-    def _mux_threshold(self) -> int:
-        """本地相似度阈值（百分比）；非法值回落到默认 70。"""
-        try:
-            value = int(float(self.mux_threshold_var.get()))
-        except (TypeError, ValueError):
-            return DUPLICATE_THRESHOLD_DEFAULT
-        return max(DUPLICATE_AI_LOW, min(100, value))
-
-    def _translation_language_options(self, *, include_auto: bool) -> list[str]:
-        languages = [language for language in LANGUAGES
-                     if include_auto or language != "自动检测"]
-        return [*languages, *self.custom_translation_languages, CUSTOM_LANGUAGE_ENTRY]
-
-    def _select_custom_language(self, variable: tk.StringVar, combobox,
-                                language_kind: str):
-        selected = variable.get()
-        previous_attr = f"_{language_kind}_language_previous"
-        if selected != CUSTOM_LANGUAGE_ENTRY:
-            setattr(self, previous_attr, selected)
-            return
-
-        previous = getattr(self, previous_attr)
-        label = "源语言" if language_kind == "source" else "目标语言"
-        value = simpledialog.askstring(
-            "自定义翻译语言", f"请输入{label}名称（例如：粤语、古希腊语或 Klingon）：",
-            parent=self.root)
-        value = str(value or "").strip()
-        if not value or value == CUSTOM_LANGUAGE_ENTRY:
-            variable.set(previous)
-            return
-
-        if value not in LANGUAGES and value not in self.custom_translation_languages:
-            self.custom_translation_languages.append(value)
-        self.source_language_box.configure(
-            values=self._translation_language_options(include_auto=True))
-        self.target_language_box.configure(
-            values=self._translation_language_options(include_auto=False))
-        variable.set(value)
-        setattr(self, previous_attr, value)
-        self.status_var.set(f"已选择自定义{label}：{value}")
-
-    def _on_translate_source_change(self, _event=None):
-        self._update_translate_source_hint()
-
-    def _update_translate_source_hint(self):
-        mode = self.translate_source_var.get()
-        if mode == TRANSLATE_SOURCE_ASR:
-            text = ("一律先识别「音轨」里选的那条音轨再用识别结果翻译"
-                    "（计划里没加识别步骤也会自动补一次）。")
-        elif mode == TRANSLATE_SOURCE_PROBE:
-            text = (f"计划里没加识别步骤、或选不到那条音轨时，先取开头 "
-                    f"{PROBE_SAMPLE_SECONDS // 60} 分钟用 {PROBE_WHISPER_MODEL} 探针校验已有内嵌字幕："
-                    "对得上就直接用它翻译，对不上再完整识别。")
-        elif mode == TRANSLATE_SOURCE_EMBEDDED:
-            text = "直接用文件里的第一条内嵌字幕，不识别（会先让 AI 判语言）。"
-        else:
-            text = "直接用媒体同目录的同名字幕文件，不识别（会先让 AI 判语言）。"
-        self.translate_source_hint_var.set(text)
-
-    # ------------------------------------------- 要输出的字幕轨与内嵌字幕取舍
-    def _selected_drop_subtitles(self) -> list[int]:
-        """压制时要删除的内嵌字幕序号（0 起，按字幕流顺序）；未勾选的才算删除。"""
-        return [item["ordinal"] for item in self.embedded_subtitles
-                if not self._mux_sub_keep.get(item["ordinal"], True)]
-
-    def _on_mux_track_kind(self, _event=None):
-        """选中列表项时立即加入（选「外部字幕文件…」则弹文件框，可多选）。"""
-        self._add_mux_track()
-
-    def _mux_track_label(self, track: dict) -> str:
-        if track.get("kind") == "external":
-            return f"外部字幕 · {Path(track['path']).name}"
-        return f"生成的字幕 · {track.get('mode') or '原文'}"
-
-    def _mux_track_language(self, track: dict) -> str:
-        """这条字幕轨写给播放器的语言标记（在导出时才取当前语言设置）。"""
-        if track.get("language"):
-            return str(track["language"])
-        if track.get("kind") == "external":
-            return guess_subtitle_language(track["path"])
-        if (track.get("mode") or "原文") == "原文":
-            return subtitle_language_code(self.source_var.get())
-        return subtitle_language_code(self.target_var.get())
-
-    def _refresh_mux_tracks_tree(self, select: int | None = None):
-        tree = getattr(self, "mux_tracks_tree", None)
-        if tree is None:
-            return
-        tree.delete(*tree.get_children())
-        for index, track in enumerate(self._mux_tracks):
-            tree.insert("", "end", iid=str(index),
-                        values=(index + 1, self._mux_track_label(track),
-                                self._mux_track_language(track)),
-                        tags=("first",) if index == 0 else ())
-        if select is not None and 0 <= select < len(self._mux_tracks):
-            tree.selection_set(str(select))
-            tree.see(str(select))
-
-    def _add_mux_track(self):
-        """把当前选择的条目加入列表（外部字幕文件可一次多选）。"""
-        kind = self.mux_track_kind_var.get()
-        if kind == MUX_TRACK_EXTERNAL:
-            paths = self._choose_mux_subtitle_files()
-            if not paths:
-                return
-            for path in paths:
-                self._mux_tracks.append({"kind": "external", "path": path,
-                                         "language": None})
-        else:
-            mode = MUX_TRACK_MODES.get(kind, "原文")
-            if any(track.get("kind") != "external" and track.get("mode") == mode
-                   for track in self._mux_tracks):
-                self.status_var.set(f"「{mode}」已经在列表里了。")
-                return
-            self._mux_tracks.append({"kind": "generated", "mode": mode,
-                                     "language": None})
-        self._refresh_mux_tracks_tree(select=len(self._mux_tracks) - 1)
-        self._update_export_hint()
-        self.status_var.set(f"已加入 {len(self._mux_tracks)} 条字幕轨")
-
-    def _choose_mux_subtitle_files(self) -> list[Path]:
-        """选择要压制的字幕文件（可多选；默认目录 = 媒体所在目录）。"""
-        options = {
-            "title": "选择要压制的字幕文件（可多选）",
-            "filetypes": [("字幕文件", "*.srt *.ass *.ssa *.vtt *.sub *.smi *.lrc"),
-                          ("所有文件", "*.*")],
-        }
-        folder = self._default_subtitle_dir()
-        if folder is not None:
-            options["initialdir"] = str(folder)
-        chosen = filedialog.askopenfilenames(**options)
-        paths: list[Path] = []
-        seen = {str(track.get("path")) for track in self._mux_tracks}
-        for item in chosen or ():
-            path = Path(item)
-            if str(path) in seen:
-                continue
-            seen.add(str(path))
-            paths.append(path)
-        return paths
-
-    def _remove_mux_track(self):
-        tree = getattr(self, "mux_tracks_tree", None)
-        if tree is None:
-            return
-        selection = tree.selection()
-        if not selection:
-            self.status_var.set("先在列表里选中要移除的字幕轨。")
-            return
-        index = int(selection[0])
-        if 0 <= index < len(self._mux_tracks):
-            removed = self._mux_tracks.pop(index)
-            self._append_log(f"已移出字幕轨：{self._mux_track_label(removed)}")
-        self._refresh_mux_tracks_tree()
-        self._update_export_hint()
-
-    def _clear_mux_tracks(self):
-        if not self._mux_tracks:
-            return
-        self._mux_tracks = []
-        self._refresh_mux_tracks_tree()
-        self._update_export_hint()
-        self.status_var.set("已清空字幕轨列表（改为按「字幕语言」输出 1 条）")
-
-    def _set_default_mux_track(self):
-        """把选中的字幕轨移到最前（第一条 = 播放器默认显示的那条）。"""
-        tree = getattr(self, "mux_tracks_tree", None)
-        if tree is None:
-            return
-        selection = tree.selection()
-        if not selection:
-            self.status_var.set("先在列表里选中要设为默认的字幕轨。")
-            return
-        index = int(selection[0])
-        if index <= 0 or index >= len(self._mux_tracks):
-            return
-        self._mux_tracks.insert(0, self._mux_tracks.pop(index))
-        self._refresh_mux_tracks_tree(select=0)
-        self._update_export_hint()
-        self.status_var.set("已设为默认字幕轨（列表第一条）")
-
-    def _mux_track_specs(self) -> list[dict] | None:
-        """导出 / 计划统一用的字幕轨设置；列表为空返回 None（= 按「字幕语言」输出 1 条）。
-
-        外部字幕会附带 `bind`（字幕相对当前媒体的命名关系）；加入计划后按同样的关系
-        去每个文件旁边找对应字幕，避免把同一个字幕压进所有文件。
-        """
-        specs: list[dict] = []
-        for track in self._mux_tracks:
-            language = self._mux_track_language(track)
-            if track.get("kind") == "external":
-                path = Path(track["path"])
-                specs.append({"kind": "external", "path": str(path),
-                              "language": language, "title": path.stem,
-                              "bind": subtitle_binding(self.media_path, path)})
-            else:
-                mode = track.get("mode") or "原文"
-                specs.append({"kind": "generated", "mode": mode,
-                              "language": language, "title": mode})
-        return specs or None
-
-    def _on_mux_subs_wheel(self, event):
-        """内嵌字幕列表只占几行高，滚轮可以翻看剩下的行。"""
-        self.mux_subs_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-        return "break"
-
-    def _refresh_mux_embedded_subs(self):
-        """按当前媒体的内嵌字幕重建「保留 / 删除」勾选框（勾选 = 保留）。"""
-        frame = getattr(self, "mux_subs_frame", None)
-        if frame is None:
-            return
-        for child in frame.winfo_children():
-            child.destroy()
-        self._mux_sub_vars = {}
-        self._mux_sub_checks = []
-        count = len(self.embedded_subtitles)
-        if not count:
-            ttk.Label(frame, text="当前媒体没有内嵌字幕。",
-                      style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w",
-                                                        pady=(self.px(2), 0))
-            return
-        columns = 1 if count <= 6 else 2      # 字幕轨多时分两列，减少需要滚动的行数
-        per_column = (count + columns - 1) // columns
-        for position, item in enumerate(self.embedded_subtitles):
-            ordinal = item["ordinal"]
-            var = tk.BooleanVar(value=self._mux_sub_keep.get(ordinal, True))
-            self._mux_sub_vars[ordinal] = var
-            check = ttk.Checkbutton(
-                frame, text=f"{item['label']} · {item['codec']}", variable=var,
-                command=lambda o=ordinal, v=var: self._on_mux_sub_toggle(o, v))
-            check.grid(row=position % per_column, column=position // per_column,
-                       sticky="w", padx=(0, self.px(10)))
-            self._mux_sub_checks.append(check)
-        canvas = getattr(self, "mux_subs_canvas", None)
-        if canvas is not None:
-            canvas.yview_moveto(0.0)
-
-    def _on_mux_sub_toggle(self, ordinal: int, var: tk.BooleanVar):
-        """勾选 / 取消内嵌字幕：记下取舍并刷新提示。"""
-        self._mux_sub_keep[ordinal] = bool(var.get())
-        self._update_export_hint()
-
-    def _set_all_mux_subs(self, keep: bool):
-        for ordinal, var in getattr(self, "_mux_sub_vars", {}).items():
-            var.set(keep)
-            self._mux_sub_keep[ordinal] = keep
-        self._update_export_hint()
-
-    def _on_subtitle_language_change(self, _event=None):
-        self.refresh_preview()
-        self._update_export_hint()
-
-    def _choose_media(self):
-        path = filedialog.askopenfilename(
-            title="选择视频或音频",
-            filetypes=[("媒体文件", "*." + " *.".join(sorted(ext[1:] for ext in MEDIA_EXTENSIONS))),
-                       ("所有文件", "*.*")],
-        )
+            QTimer.singleShot(0, lambda: self.load_media(initial_path))
+
+    def _build_ui(self):
+        central = QWidget(self)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(14, 12, 14, 10)
+        header = QHBoxLayout()
+        title = QLabel("字幕工作台")
+        title.setStyleSheet("font-size: 18pt; font-weight: 700")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.choose_button = QPushButton("选择媒体…")
+        self.choose_button.setObjectName("primary")
+        self.choose_button.clicked.connect(self.choose_media)
+        self.subtitle_button = QPushButton("载入字幕…")
+        self.subtitle_button.clicked.connect(self.choose_subtitle)
+        header.addWidget(self.subtitle_button)
+        header.addWidget(self.choose_button)
+        outer.addLayout(header)
+        self.path_label = QLabel("媒体尚未载入")
+        self.path_label.setWordWrap(True)
+        outer.addWidget(self.path_label)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.split = split
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 8, 0)
+        left_split = QSplitter(Qt.Orientation.Vertical)
+        self.left_split = left_split
+        preview_area = QWidget()
+        preview_layout = QVBoxLayout(preview_area)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview = QLabel("拖入媒体后预览画面")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(400, 260)
+        self.preview.setStyleSheet("background:#0e1512;color:#d6e4dc;border:1px solid #d9e2db")
+        preview_layout.addWidget(self.preview, 2)
+        transport = QHBoxLayout()
+        self.play_button = QPushButton("播放")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self.toggle_playback)
+        self.prev_button = QPushButton("上一句")
+        self.prev_button.setEnabled(False)
+        self.prev_button.clicked.connect(lambda: self.jump_entry(-1))
+        self.next_button = QPushButton("下一句")
+        self.next_button.setEnabled(False)
+        self.next_button.clicked.connect(lambda: self.jump_entry(1))
+        transport.addWidget(self.prev_button)
+        transport.addWidget(self.play_button)
+        transport.addWidget(self.next_button)
+        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek.setRange(0, 10000)
+        self.seek.setEnabled(False)
+        self.seek.sliderMoved.connect(self.seek_video)
+        transport.addWidget(self.seek, 1)
+        self.time_label = QLabel("00:00 / 00:00")
+        transport.addWidget(self.time_label)
+        left_layout.addLayout(transport)
+        self.subtitle_model = _SubtitleTableModel(self)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(1500)
+        self.log_view.setStyleSheet(
+            "QTextEdit { background:#ffffff; color:#1d2c26; border:1px solid #d9e2db;"
+            " font-family:'Cascadia Mono','Consolas',monospace; font-size:9pt; }")
+        self.left_split.addWidget(preview_area)
+        self.left_split.addWidget(self.log_view)
+        self.left_split.setStretchFactor(0, 3)
+        self.left_split.setStretchFactor(1, 1)
+        left_layout.addWidget(self.left_split)
+        split.addWidget(left)
+
+        self.tabs = QTabWidget()
+        self._build_media_tab()
+        self._build_asr_tab()
+        self._build_translation_tab()
+        self._build_export_tab()
+        self._build_plan_tab()
+        split.addWidget(self.tabs)
+        split.setSizes([620, 600])
+        outer.addWidget(split, 1)
+        self.status_label = QLabel()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        outer.addWidget(self.status_label)
+        outer.addWidget(self.progress)
+        self.setCentralWidget(central)
+
+    def _build_media_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.media_stats = QLabel("拖入媒体文件后显示轨道信息。")
+        self.media_stats.setWordWrap(True)
+        layout.addWidget(self.media_stats)
+        form = QFormLayout()
+        self.audio_box = QComboBox()
+        self.audio_box.currentIndexChanged.connect(self._audio_changed)
+        form.addRow("音轨", self.audio_box)
+        self.subtitle_box = QComboBox()
+        self.subtitle_box.addItem("不使用字幕")
+        self.subtitle_box.currentIndexChanged.connect(self.select_subtitle)
+        form.addRow("字幕来源", self.subtitle_box)
+        self.sync_spin = QDoubleSpinBox()
+        self.sync_spin.setRange(-10, 10)
+        self.sync_spin.setSingleStep(0.05)
+        self.sync_spin.setSuffix(" 秒")
+        self.sync_spin.valueChanged.connect(self._refresh_preview_frame)
+        form.addRow("字幕同步", self.sync_spin)
+        layout.addLayout(form)
+        list_head = QHBoxLayout()
+        list_head.addWidget(QLabel("字幕条目"))
+        list_head.addStretch(1)
+        self.entry_stats = QLabel("0 条")
+        list_head.addWidget(self.entry_stats)
+        layout.addLayout(list_head)
+        self.subtitle_table = QTableView()
+        self.subtitle_table.setModel(self.subtitle_model)
+        self.subtitle_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.subtitle_table.setAlternatingRowColors(True)
+        self.subtitle_table.horizontalHeader().setStretchLastSection(True)
+        self.subtitle_table.setColumnWidth(0, 48)
+        self.subtitle_table.setColumnWidth(1, 90)
+        self.subtitle_table.clicked.connect(self._subtitle_selected)
+        layout.addWidget(self.subtitle_table, 1)
+        self.tabs.addTab(page, "媒体与字幕")
+
+    def _build_asr_tab(self):
+        page = QWidget()
+        form = QFormLayout(page)
+        self.asr_model = QComboBox()
+        self.asr_model.addItems(WHISPER_MODELS)
+        self.asr_model.setCurrentText(default_whisper_model())
+        form.addRow("Whisper 模型", self.asr_model)
+        self.asr_language = QComboBox()
+        self.asr_language.addItems(list(LANGUAGES))
+        form.addRow("音频语言", self.asr_language)
+        actions = QHBoxLayout()
+        self.asr_button = QPushButton("识别所选音轨")
+        self.asr_button.setObjectName("primary")
+        self.asr_button.clicked.connect(self.start_transcription)
+        self.plan_asr_button = QPushButton("加入计划")
+        self.plan_asr_button.clicked.connect(self.add_asr_step)
+        actions.addWidget(self.plan_asr_button)
+        actions.addWidget(self.asr_button)
+        form.addRow(actions)
+        self.tabs.addTab(page, "识别")
+
+    def _build_translation_tab(self):
+        page = QWidget()
+        form = QFormLayout(page)
+        self.model_box = QComboBox()
+        self.model_box.addItems([item["name"] for item in translation_models()])
+        self.model_box.setCurrentText(default_translation_model())
+        self.model_box.currentTextChanged.connect(self._model_changed)
+        form.addRow("翻译模型", self.model_box)
+        self.source_box = QComboBox()
+        self.source_box.setEditable(True)
+        self.source_box.addItems(list(LANGUAGES))
+        self.source_box.setCurrentText("自动检测")
+        self.target_box = QComboBox()
+        self.target_box.setEditable(True)
+        self.target_box.addItems(list(LANGUAGES))
+        self.target_box.setCurrentText("中文（简体）")
+        form.addRow("源语言", self.source_box)
+        form.addRow("目标语言", self.target_box)
+        self.concurrency = QSpinBox()
+        self.concurrency.setRange(1, 100)
+        model = translation_model_by_name(self.model_box.currentText())
+        self.concurrency.setValue(model_concurrency(model) if model else default_translation_concurrency())
+        form.addRow("并发请求", self.concurrency)
+        self.grouped = QCheckBox("按批次翻译")
+        self.batch_size = QSpinBox()
+        self.batch_size.setRange(subtitles.BATCH_SIZE_MIN, subtitles.BATCH_SIZE_MAX)
+        self.batch_size.setValue(subtitles.DEFAULT_BATCH_SIZE)
+        self.batch_size.setEnabled(False)
+        self.grouped.toggled.connect(self.batch_size.setEnabled)
+        form.addRow(self.grouped, self.batch_size)
+        self.context = QSpinBox()
+        self.context.setRange(0, CONTEXT_LINES_MAX)
+        self.context.setValue(DEFAULT_CONTEXT_LINES)
+        form.addRow("上下文句数", self.context)
+        self.translate_source = QComboBox()
+        self.translate_source.addItems(list(TRANSLATE_SOURCES))
+        form.addRow("翻译来源", self.translate_source)
+        self.translation_progress = QProgressBar()
+        form.addRow(self.translation_progress)
+        actions = QHBoxLayout()
+        self.plan_translate_button = QPushButton("加入计划")
+        self.plan_translate_button.clicked.connect(self.add_translate_step)
+        self.cancel_translate_button = QPushButton("取消翻译")
+        self.cancel_translate_button.setEnabled(False)
+        self.cancel_translate_button.clicked.connect(self.cancel_translation)
+        self.translate_button = QPushButton("开始翻译")
+        self.translate_button.setObjectName("primary")
+        self.translate_button.clicked.connect(self.start_translation)
+        actions.addWidget(self.plan_translate_button)
+        actions.addWidget(self.cancel_translate_button)
+        actions.addWidget(self.translate_button)
+        form.addRow(actions)
+        self.tabs.addTab(page, "翻译")
+
+    def _build_export_tab(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        self.export_tabs = QTabWidget()
+        external = QWidget()
+        form = QFormLayout(external)
+        self.export_format = QComboBox()
+        self.export_format.addItems(["SRT", "ASS", "VTT"])
+        self.export_language = QComboBox()
+        self.export_language.addItems(["原文", "译文", "双语"])
+        form.addRow("字幕格式", self.export_format)
+        form.addRow("字幕内容", self.export_language)
+        self.export_hint = QLabel("载入媒体后显示预计输出文件名")
+        self.export_hint.setWordWrap(True)
+        form.addRow(self.export_hint)
+        row = QHBoxLayout()
+        self.plan_export_button = QPushButton("加入计划")
+        self.plan_export_button.clicked.connect(self.add_export_step)
+        self.export_button = QPushButton("导出外挂字幕")
+        self.export_button.setObjectName("primary")
+        self.export_button.clicked.connect(self.start_export)
+        row.addWidget(self.plan_export_button)
+        row.addWidget(self.export_button)
+        form.addRow(row)
+        self.export_tabs.addTab(external, "外挂字幕")
+
+        embedded = QWidget()
+        mux_form = QFormLayout(embedded)
+        self.mux_mode = QComboBox()
+        self.mux_mode.addItems(["原文", "译文", "双语"])
+        self.mux_format = QComboBox()
+        self.mux_format.addItems(["SRT", "ASS", "VTT"])
+        mux_form.addRow("新增生成字幕", self.mux_mode)
+        mux_form.addRow("封装格式", self.mux_format)
+        self.mux_tracks_tree = QTreeWidget()
+        self.mux_tracks_tree.setHeaderLabels(["类型", "字幕 / 文件"])
+        mux_form.addRow(self.mux_tracks_tree)
+        controls = QHBoxLayout()
+        add_generated = QPushButton("添加生成轨")
+        add_generated.clicked.connect(self.add_generated_track)
+        add_external = QPushButton("添加外挂字幕…")
+        add_external.clicked.connect(self.add_external_tracks)
+        remove_track = QPushButton("移除所选")
+        remove_track.clicked.connect(self.remove_mux_track)
+        controls.addWidget(add_generated)
+        controls.addWidget(add_external)
+        controls.addWidget(remove_track)
+        mux_form.addRow(controls)
+        self.keep_existing = QCheckBox("保留输入媒体原有字幕轨")
+        self.keep_existing.setChecked(True)
+        mux_form.addRow(self.keep_existing)
+        self.embedded_tree = QTreeWidget()
+        self.embedded_tree.setHeaderLabels(["保留", "原字幕轨"])
+        mux_form.addRow(self.embedded_tree)
+        self.check_duplicates = QCheckBox("压制前检查同语言重复字幕")
+        self.check_duplicates.setChecked(True)
+        mux_form.addRow(self.check_duplicates)
+        duplicate_row = QHBoxLayout()
+        self.duplicate_threshold = QSpinBox()
+        self.duplicate_threshold.setRange(1, 100)
+        self.duplicate_threshold.setValue(DUPLICATE_THRESHOLD_DEFAULT)
+        duplicate_row.addWidget(QLabel("重复相似度阈值"))
+        duplicate_row.addWidget(self.duplicate_threshold)
+        duplicate_row.addStretch(1)
+        mux_form.addRow(duplicate_row)
+        self.mux_hint = QLabel("封装会生成新媒体文件，不覆盖输入文件。")
+        self.mux_hint.setWordWrap(True)
+        mux_form.addRow(self.mux_hint)
+        mux_actions = QHBoxLayout()
+        self.plan_mux_button = QPushButton("加入封装计划")
+        self.plan_mux_button.clicked.connect(self.add_mux_step)
+        self.mux_button = QPushButton("内嵌封装")
+        self.mux_button.setObjectName("primary")
+        self.mux_button.clicked.connect(self.start_mux)
+        mux_actions.addWidget(self.plan_mux_button)
+        mux_actions.addWidget(self.mux_button)
+        mux_form.addRow(mux_actions)
+        self.export_tabs.addTab(embedded, "内嵌字幕")
+        self.export_tabs.currentChanged.connect(self._refresh_preview_frame)
+        self.export_language.currentTextChanged.connect(self._refresh_preview_frame)
+        self.mux_mode.currentTextChanged.connect(self._refresh_preview_frame)
+        for control in (self.export_format, self.export_language, self.mux_mode,
+                        self.mux_format, self.keep_existing):
+            signal = control.toggled if isinstance(control, QCheckBox) else control.currentTextChanged
+            signal.connect(self._update_export_hint)
+        outer.addWidget(self.export_tabs)
+        self.tabs.addTab(page, "导出与封装")
+
+    def _build_plan_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.steps_tree = QTreeWidget()
+        self.steps_tree.setHeaderLabels(["#", "步骤", "设置"])
+        layout.addWidget(QLabel("计划步骤"))
+        layout.addWidget(self.steps_tree, 1)
+        step_row = QHBoxLayout()
+        for label, callback in (("上移", lambda: self.move_step(-1)),
+                                ("下移", lambda: self.move_step(1)),
+                                ("删除", self.remove_step), ("清空", self.clear_steps)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            self.plan_edit_controls.append(button)
+            step_row.addWidget(button)
+        layout.addLayout(step_row)
+        self.files_tree = QTreeWidget()
+        self.files_tree.setHeaderLabels(["媒体文件", "状态"])
+        layout.addWidget(QLabel("待处理文件"))
+        layout.addWidget(self.files_tree, 1)
+        file_row = QHBoxLayout()
+        for label, callback in (("添加文件…", self.choose_plan_files),
+                                ("添加当前媒体", self.add_current_file),
+                                ("移除", self.remove_plan_file), ("清空", self.clear_plan_files)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            self.plan_edit_controls.append(button)
+            file_row.addWidget(button)
+        layout.addLayout(file_row)
+        self.plan_continue = QCheckBox("失败后继续下一个文件")
+        self.plan_continue.setChecked(True)
+        layout.addWidget(self.plan_continue)
+        actions = QHBoxLayout()
+        self.stop_plan_button = QPushButton("停止")
+        self.stop_plan_button.setEnabled(False)
+        self.stop_plan_button.clicked.connect(self.stop_plan)
+        self.run_plan_button = QPushButton("开始执行计划")
+        self.run_plan_button.setObjectName("primary")
+        self.run_plan_button.clicked.connect(self.start_plan)
+        actions.addWidget(self.stop_plan_button)
+        actions.addWidget(self.run_plan_button)
+        layout.addLayout(actions)
+        self.tabs.addTab(page, "计划任务")
+
+    def _submit(self, function, on_result, busy=True):
+        worker = _QtTask(function)
+        self._workers.add(worker)
+        worker.signals.result.connect(on_result)
+        worker.signals.error.connect(self._worker_error)
+        worker.signals.log.connect(self._append_log)
+        worker.signals.status.connect(self._set_status)
+        worker.signals.progress.connect(self._progress_update)
+        worker.signals.finished.connect(self._worker_finished)
+        if busy:
+            self._set_busy(True)
+        self.pool.start(worker)
+
+    def _worker_finished(self, worker):
+        self._workers.discard(worker)
+        if self._busy and self.plan_cancel is None:
+            self._set_busy(False)
+
+    def _set_busy(self, busy):
+        self._busy = bool(busy)
+        for control in (self.choose_button, self.subtitle_button, self.asr_button,
+                        self.translate_button, self.export_button, self.mux_button):
+            control.setEnabled(not busy)
+        for control in self.plan_edit_controls:
+            control.setEnabled(not busy)
+        self.run_plan_button.setEnabled(not busy)
+
+    def _worker_error(self, message, details):
+        if self.plan_cancel is not None:
+            self.plan_cancel = None
+            self.stop_plan_button.setEnabled(False)
+        self._set_busy(False)
+        self._set_status("操作失败")
+        self._append_log(f"错误：{message}\n{details}")
+        QMessageBox.critical(self, "处理失败", message)
+
+    def _progress_update(self, done, total):
+        self.progress.setRange(0, max(1, int(total)))
+        self.progress.setValue(min(int(done), max(1, int(total))))
+
+    def _set_status(self, text):
+        self.status_label.setText(str(text))
+
+    def _append_log(self, text):
+        if text:
+            self.log_view.append(str(text))
+
+    def choose_media(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择视频或音频", "",
+            "媒体文件 (" + " ".join(f"*{ext}" for ext in sorted(MEDIA_EXTENSIONS)) + ");;所有文件 (*)")
         if path:
             self.load_media(path)
 
-    def _drop_media(self, event):
-        self._set_drop_hover(False)
-        try:
-            paths = [Path(item) for item in self.root.tk.splitlist(event.data)]
-        except tk.TclError:
+    def load_media(self, path):
+        media = Path(path).expanduser()
+        if media.suffix.lower() in SUBTITLE_EXTENSIONS:
+            self._adopt_subtitle(media)
             return
-        media = next((path for path in paths if path.suffix.lower() in MEDIA_EXTENSIONS), None)
-        subtitle = next((path for path in paths if path.suffix.lower() in SUBTITLE_EXTENSIONS), None)
-        if media is not None:
-            if subtitle is not None:
-                self._pending_subtitle = subtitle
-            self.load_media(media)
-        elif subtitle is not None:
-            self._adopt_external_subtitle(subtitle)
-        elif paths:
-            self.status_var.set("拖入的文件既不是媒体也不是字幕，已忽略。")
-
-    def load_media(self, path: str | Path):
-        media_path = Path(path).expanduser()
-        if media_path.suffix.lower() in SUBTITLE_EXTENSIONS:
-            self._adopt_external_subtitle(media_path)
+        if not media.is_file() or media.suffix.lower() not in MEDIA_EXTENSIONS:
+            QMessageBox.warning(self, "无法打开", "请选择有效的视频或音频文件。")
             return
-        if not media_path.is_file() or media_path.suffix.lower() not in MEDIA_EXTENSIONS:
-            messagebox.showerror("无法打开", "请选择有效的视频或音频文件。")
-            return
-        self._run_worker("正在读取媒体轨道…", self._load_media_worker, media_path)
+        self._set_status("正在读取媒体轨道…")
 
-    def _load_media_worker(self, media_path: Path):
-        info = probe_media(media_path)
-        audio, embedded, videos = probe_tracks(info)
-        external = subtitle_candidates(media_path)
-        return media_path, info, audio, embedded, videos, external
+        def load(_signals):
+            info = probe_media(media)
+            audio, embedded, videos = probe_tracks(info)
+            return media, info, audio, embedded, videos, subtitle_candidates(media)
 
-    def _choose_audio(self, loaded):
-        media_path, info, audio, embedded, videos, external = loaded
+        self._submit(load, self._media_loaded)
+
+    def _media_loaded(self, result):
+        media, self.media_info, self.audio_tracks, self.embedded_subtitles, videos, self.external_subtitles = result
         self._close_video()
-        self.media_path, self.media_info = media_path, info
-        self.audio_tracks, self.embedded_subtitles = audio, embedded
-        self.external_subtitles = external
-        self.entries, self.original_entries, self.translated = [], [], []
-        self.subtitle_source = None
-        self._audio_index = 0
-        self._mux_sub_keep = {}          # 换文件后内嵌字幕序号重新映射
-        self.path_var.set(str(media_path))
-        if audio:
-            self.audio_box["values"] = [item["label"] for item in audio]
-            self.audio_box.current(0)
-        else:
-            self.audio_box["values"] = ["未检测到音轨"]
-            self.audio_box.set("未检测到音轨")
-        self._rebuild_subtitle_options(select=1 if (embedded or external) else 0)
-        if self._subtitle_index > 0:
-            self._select_subtitle()
-        else:
-            self._populate_tree()
-            self.refresh_preview()
-        self.asr_status_var.set("")
-        self.translate_progress.configure(maximum=1, value=0)
-        self._set_translate_running(False)
-        self._update_media_stats()
-        self._refresh_mux_embedded_subs()
+        self.media_path = media
+        self.entries = self.original_entries = self.translated = []
+        self.mux_tracks = []
+        self.path_label.setText(str(media))
+        self.audio_box.clear()
+        self.audio_box.addItems([item["label"] for item in self.audio_tracks] or ["未检测到音轨"])
+        self.subtitle_box.blockSignals(True)
+        self.subtitle_box.clear()
+        self.subtitle_box.addItem("不使用字幕")
+        self.subtitle_box.addItems([item["label"] for item in self.embedded_subtitles])
+        self.subtitle_box.addItems([f"外置字幕 · {path.name}" for path in self.external_subtitles])
+        self.subtitle_box.addItem(SUBTITLE_IMPORT_ENTRY)
+        self.subtitle_box.blockSignals(False)
+        self._populate_embedded_tree()
+        size = media.stat().st_size / 1_048_576
+        self.media_stats.setText(
+            f"{media.name}\n{size:,.1f} MB · {len(self.audio_tracks)} 音轨 · "
+            f"{len(self.embedded_subtitles)} 内嵌字幕 · {len(self.external_subtitles)} 外置字幕")
+        self.mux_tracks_tree.clear()
+        self._populate_subtitles()
         self._update_export_hint()
-        self.status_var.set(
-            f"已载入：{len(audio)} 条音轨 · {len(embedded)} 条内嵌字幕 · "
-            f"{len(external)} 个同目录字幕"
-        )
-        self._append_log(f"已载入媒体：{media_path.name}（{len(audio)} 音轨 / "
-                         f"{len(embedded)} 内嵌字幕 / {len(external)} 外置字幕）")
-        self._open_video(media_path, bool(videos))
-        pending = self._pending_subtitle
-        if pending is not None:
-            self._pending_subtitle = None
-            self.root.after(80, lambda: self._adopt_external_subtitle(pending))
+        self._open_video(bool(videos))
+        self._set_status(f"已载入：{media.name}")
+        self._append_log(f"已载入：{media.name} · {len(self.audio_tracks)} 音轨 · {len(self.embedded_subtitles)} 内嵌字幕")
 
-    def _select_subtitle(self, _event=None):
+    def _populate_embedded_tree(self):
+        self.embedded_tree.clear()
+        for track in self.embedded_subtitles:
+            item = QTreeWidgetItem(["", track.get("label", "字幕轨")])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Checked)
+            item.setData(0, Qt.ItemDataRole.UserRole, int(track.get("ordinal", 0)))
+            self.embedded_tree.addTopLevelItem(item)
+
+    def choose_subtitle(self):
+        start = str(self.media_path.parent) if self.media_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择字幕文件", start,
+            "字幕文件 (*.srt *.ass *.ssa *.vtt *.sub *.smi *.lrc);;所有文件 (*)")
+        if path:
+            self._adopt_subtitle(Path(path))
+            return True
+        return False
+
+    def _adopt_subtitle(self, path):
         if self.media_path is None:
-            self._restore_subtitle_selection()
+            QMessageBox.information(self, "需要媒体", "请先载入媒体文件，再载入字幕。")
             return
-        selected = self.subtitle_box.current()
-        if selected < 0:
-            selected = 0
-        if selected >= self._subtitle_option_count():     # 选中了「导入外部字幕文件…」
-            self._choose_subtitle_file(restore_on_cancel=True)
+        if not path.is_file() or path.suffix.lower() not in SUBTITLE_EXTENSIONS:
             return
-        self._subtitle_index = selected
-        if selected <= 0:
-            self.entries, self.original_entries, self.translated = [], [], []
-            self.subtitle_source = None
-            self._populate_tree()
-            self.refresh_preview()
-            self.status_var.set("已关闭字幕显示。")
-            return
-        if selected <= len(self.embedded_subtitles):
-            source = self.embedded_subtitles[selected - 1]
-            self._run_worker("正在读取内嵌字幕…", self._load_subtitle_worker,
-                             "embedded", source)
-        else:
-            index = selected - len(self.embedded_subtitles) - 1
-            if index < len(self.external_subtitles):
-                path = self.external_subtitles[index]
-                self._run_worker("正在解析外置字幕…", self._load_subtitle_worker,
-                                 "external", path)
+        if path not in self.external_subtitles:
+            self.external_subtitles.append(path)
+            self.subtitle_box.addItem(f"外置字幕 · {path.name}")
+        index = len(self.embedded_subtitles) + self.external_subtitles.index(path) + 1
+        self.subtitle_box.blockSignals(True)
+        self.subtitle_box.setCurrentIndex(index)
+        self.subtitle_box.blockSignals(False)
+        self._load_subtitle(path, "external")
 
-    def _load_subtitle_worker(self, kind: str, source):
-        media_path = self.media_path
-        if media_path is None:
-            raise StudioError("请先载入媒体文件。")
-        if kind == "embedded":
-            entries = extract_embedded_subtitle(media_path, source["stream_index"])
+    def select_subtitle(self, index):
+        if index <= 0 or self.media_path is None:
+            self.entries = self.original_entries = self.translated = []
+            self._populate_subtitles()
+            return
+        if index == self.subtitle_box.count() - 1:
+            if not self.choose_subtitle():
+                self.subtitle_box.setCurrentIndex(max(0, index - 1))
+            return
+        if index <= len(self.embedded_subtitles):
+            track = self.embedded_subtitles[index - 1]
+            self._load_subtitle(track, "embedded")
         else:
-            entries = load_subtitle_document(source)
-        return entries, {"kind": kind, "source": source}
+            path = self.external_subtitles[index - len(self.embedded_subtitles) - 1]
+            self._load_subtitle(path, "external")
 
-    def _subtitle_loaded(self, result):
-        self.entries, self.subtitle_source = result
-        self.original_entries = copy.deepcopy(result[0])
+    def _load_subtitle(self, source, kind):
+        media = self.media_path
+
+        def load(_signals):
+            if kind == "embedded":
+                return extract_embedded_subtitle(media, source["stream_index"])
+            return load_subtitle_document(source)
+
+        self._submit(load, self._subtitle_loaded)
+
+    def _subtitle_loaded(self, entries):
+        self.entries = copy.deepcopy(entries)
+        self.original_entries = copy.deepcopy(entries)
         self.translated = []
-        self._populate_tree()
-        self.refresh_preview()
-        self.status_var.set(f"字幕已载入：{len(self.entries)} 条")
-        self._append_log(f"字幕已载入：{len(self.entries)} 条")
-
-    def _populate_tree(self):
-        if getattr(self, "tree", None) is None:
-            return
-        self.tree.delete(*self.tree.get_children())
-        for index, entry in enumerate(self.entries):
-            timestamp = self._format_timestamp(entry["start_ms"])
-            text = entry["text"].replace("\n", " / ")
-            self.tree.insert("", "end", iid=str(index),
-                             values=(index + 1, timestamp, text),
-                             tags=("odd" if index % 2 else "even",))
-        self._update_entry_stats()
-
-    def _selected_entry(self):
-        try:
-            index = int(self.tree.selection()[0])
-            return self.entries[index]
-        except (ValueError, IndexError):
-            return None
-
-    def _select_entry(self, _event=None):
-        entry = self._selected_entry()
-        if entry is not None:
-            self._seek_video(entry["start_ms"] / 1000.0)
-
-    def _jump_entry(self, delta: int):
-        if not self.entries or self.video_capture is None:
-            return
-        current = self.position_var.get() * 1000
-        starts = [entry["start_ms"] for entry in self.entries]
-        if delta > 0:
-            target = next((index for index, start in enumerate(starts)
-                           if start > current + 1), len(starts) - 1)
-        else:
-            target = max((index for index, start in enumerate(starts)
-                          if start < current - 1), default=0)
-        target = max(0, min(target, len(self.entries) - 1))
-        entry = self.entries[target]
-        self._seek_video(entry["start_ms"] / 1000.0)
-        if self.tree is not None:
-            self.tree.selection_set(str(target))
-            self.tree.see(str(target))
-
-    def refresh_preview(self):
-        if self.current_frame is None:
-            return
-        self._render_video_frame()
-
-    def _open_video(self, media_path: Path, has_video: bool):
-        self._set_transport_enabled(False)
-        self._caption_cache = {}
-        self._photo_image = None
-        self._photo_size = None
-        if not has_video:
-            self._draw_preview_placeholder(
-                "音频文件：没有视频画面\n播放时可叠加字幕预览（不会烧录）")
-            self.time_label_var.set("音频")
-            return
-        if cv2 is None:
-            message = opencv_missing_message()
-            self._draw_preview_placeholder(message)
-            self.status_var.set("缺少 OpenCV：无法预览视频画面（识别 / 翻译 / 导出仍可用）")
-            self._append_log(message.replace("\n", " · "))
-            return
-        capture = cv2.VideoCapture(str(media_path))
-        if not capture.isOpened():
-            capture.release()
-            self._draw_preview_placeholder("无法打开视频流进行预览")
-            self.status_var.set("无法打开视频流进行预览")
-            return
-        self.video_capture = capture
-        self.video_fps = max(1.0, float(capture.get(cv2.CAP_PROP_FPS) or 25.0))
-        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        self.video_duration = frame_count / self.video_fps if frame_count else 0.0
-        self.seek_scale.configure(to=max(0.1, self.video_duration))
-        self.position_var.set(0.0)
-        self._set_transport_enabled(True)
-        self._read_video_frame()
-        self.time_label_var.set(f"00:00 / {self._format_clock(self.video_duration)}")
-
-    # --------------------------------------------------- 播放时钟（按墙钟 + 音画同步）
-    def _video_delay(self) -> float:
-        """画面相对音频的额外延迟（秒）；音频主时钟已精确，仅用于微调残留偏差。"""
-        try:
-            value = float(self.sync_offset_var.get())
-        except (TypeError, ValueError):
-            return 0.0
-        return max(-2.0, min(2.0, value))
-
-    def _on_sync_change(self, *_args):
-        if getattr(self, "video_playing", False):
-            self._reset_play_clock(self.position_var.get())
-
-    def _reset_play_clock(self, seconds: float):
-        self._play_anchor_media = max(0.0, float(seconds or 0.0))
-        self._play_anchor_wall = time.monotonic() + self._video_delay()
-
-    def _capture_time_ms(self) -> float | None:
-        """解码器当前时间（毫秒）：优先用帧号推算，退回 POS_MSEC。"""
-        if self.video_capture is None:
-            return None
-        try:
-            frame_index = float(self.video_capture.get(CAP_PROP_POS_FRAMES))
-        except Exception:
-            frame_index = 0.0
-        if frame_index > 0:
-            return max(0.0, (frame_index - 1.0) / self.video_fps * 1000.0)
-        try:
-            msec = float(self.video_capture.get(CAP_PROP_POS_MSEC))
-        except Exception:
-            return None
-        return msec if msec > 0 else None
-
-    def _start_playback(self):
-        if self.video_capture is None:
-            return
-        self.video_playing = True
-        self.play_button.configure(text="❚❚ 暂停")
-        set_precise_timers(True)
-        self._reset_play_clock(self.position_var.get())
-        self._start_audio(self.position_var.get())
-        self._schedule_video_tick(0)
-
-    def _pause_playback(self):
-        self.video_playing = False
-        set_precise_timers(False)
-        if hasattr(self, "play_button"):
-            self.play_button.configure(text="▶ 播放")
-        self._stop_audio()
-        if self.video_after is not None:
-            try:
-                self.root.after_cancel(self.video_after)
-            except tk.TclError:
-                pass
-            self.video_after = None
-
-    def _schedule_video_tick(self, delay_ms: float | None = None):
-        if not self.video_playing:
-            return
-        if delay_ms is None:
-            delay_ms = 1000.0 / max(1.0, self.video_fps)
-        self.video_after = self.root.after(max(1, int(round(delay_ms))),
-                                           self._play_video_tick)
-
-    def _toggle_playback(self):
-        if self.video_capture is None:
-            return
-        if self.video_playing:
-            self._pause_playback()
-        else:
-            self._start_playback()
-
-    def _play_video_tick(self):
-        self.video_after = None
-        if not self.video_playing or self.video_capture is None:
-            return
-        interval_ms = 1000.0 / max(1.0, self.video_fps)
-        target_ms, waiting = self._playback_target_ms()
-        if waiting:                         # 音频尚未真正开始 → 保持当前帧继续等
-            self._schedule_video_tick(15.0)
-            return
-        if self.video_duration > 0 and target_ms >= self.video_duration * 1000.0:
-            self._pause_playback()
-            self.updating_position = True
-            self.position_var.set(self.video_duration)
-            self.updating_position = False
-            self.time_label_var.set(
-                f"{self._format_clock(self.video_duration)} / "
-                f"{self._format_clock(self.video_duration)}")
-            return
-        current_ms = self._capture_time_ms()
-        if current_ms is None:
-            current_ms = target_ms - interval_ms
-        wait_ms = current_ms + interval_ms - target_ms
-        if wait_ms > 1.0:                   # 还没到下一帧的显示时刻，按到期时刻再唤醒
-            self._schedule_video_tick(wait_ms)
-            return
-        # 只有明显落后（超过约 1.8 帧）才丢帧，否则逐帧播放以免帧率减半
-        skipped = 0
-        while skipped < 24 and target_ms - current_ms >= interval_ms * 1.8:
-            if not self.video_capture.grab():
-                break
-            skipped += 1
-            probed = self._capture_time_ms()
-            current_ms = probed if probed is not None else current_ms + interval_ms
-        success, frame = self.video_capture.read()
-        if not success:
-            self._pause_playback()
-            return
-        self.current_frame = frame
-        self._preview_message = None
-        self._render_video_frame()
-        shown_ms = self._capture_time_ms()
-        if shown_ms is None:
-            shown_ms = current_ms + interval_ms
-        seconds_now = shown_ms / 1000.0
-        if self.video_duration > 0:
-            seconds_now = min(seconds_now, self.video_duration)
-        self.updating_position = True
-        self.position_var.set(seconds_now)
-        self.updating_position = False
-        self.time_label_var.set(
-            f"{self._format_clock(seconds_now)} / "
-            f"{self._format_clock(self.video_duration)}")
-        # 睡到下一帧的到期时刻（音频时钟与墙钟共用同一公式；每帧只跳一次定时器）
-        next_target, next_waiting = self._playback_target_ms()
-        if next_waiting:
-            delay_ms = interval_ms
-        else:
-            delay_ms = (shown_ms + interval_ms) - next_target
-        self._schedule_video_tick(max(1.0, min(delay_ms, interval_ms * 3.0)))
-
-    def _playback_target_ms(self) -> tuple[float, bool]:
-        """画面目标时间（毫秒）与「是否需等音频开始」。
-
-        音频主时钟可用时：目标 = 音频位置 - 「同步」偏移（正数 = 画面延后）。
-        否则退回墙钟锚点（旧行为）；音频超时未开始也会自动退回。
-        """
-        clock = self.audio_clock
-        if clock is not None:
-            position = clock.position_ms()
-            if position is not None and not clock.finished:
-                return position - self._video_delay() * 1000.0, False
-            started = getattr(clock, "started_at", None)
-            if not clock.finished and started is not None \
-                    and time.monotonic() - started < 2.0:
-                return self._play_anchor_media * 1000.0, True
-            if started is not None and not clock.finished \
-                    and time.monotonic() - started >= 2.0:
-                self._append_log("音频时钟 2 秒内未能开始，已改用墙钟播放（画面不再跟随音频）")
-            self._stop_audio()
-        elapsed = time.monotonic() - self._play_anchor_wall
-        if elapsed < 0:
-            return self._play_anchor_media * 1000.0, True
-        return self._play_anchor_media * 1000.0 + elapsed * 1000.0, False
-
-    def _seek_video(self, value):
-        if self.updating_position or self.video_capture is None:
-            return
-        try:
-            seconds = max(0.0, min(float(value), self.video_duration or float(value)))
-        except (TypeError, ValueError):
-            return
-        self.video_capture.set(CAP_PROP_POS_MSEC, seconds * 1000.0)
-        self._read_video_frame()
-        if self.video_playing:              # 跳转后音频对齐：能在线 seek 就不重建进程
-            self._reset_play_clock(seconds)
-            clock = self.audio_clock
-            if not (clock is not None and getattr(clock, "supports_seek", False)
-                    and clock.seek(seconds)):
-                self._start_audio(seconds)
-            self._schedule_video_tick(0)
-
-    def _read_video_frame(self):
-        if self.video_capture is None:
-            return
-        success, frame = self.video_capture.read()
-        if not success:
-            return
-        self.current_frame = frame
-        self._preview_message = None
-        self._fit_preview_canvas()
-        current_ms = self._capture_time_ms()
-        if current_ms is not None:
-            seconds = current_ms / 1000.0
-            if self.video_duration > 0:
-                seconds = min(seconds, self.video_duration)
-            self.updating_position = True
-            self.position_var.set(seconds)
-            self.updating_position = False
-            self.time_label_var.set(
-                f"{self._format_clock(seconds)} / {self._format_clock(self.video_duration)}")
-        self._render_video_frame()
-
-    @staticmethod
-    def _format_clock(seconds: float) -> str:
-        total = max(0, int(seconds))
-        return f"{total // 60:02d}:{total % 60:02d}"
-
-    # -------------------------------------------------- 字幕叠加（按文件格式渲染）
-    @staticmethod
-    def _entry_block(entry: dict) -> dict | None:
-        block = entry.get("_preview")
-        if block is None:
-            block = default_preview_block(str(entry.get("text") or ""))
-        if not any(block.get("lines") or []):
-            return None
-        return block
-
-    @staticmethod
-    def _plain_block(text: str) -> dict | None:
-        if not (text or "").strip():
-            return None
-        return default_preview_block(text)
-
-    def _caption_blocks_for(self, seconds: float) -> list[dict]:
-        """当前时间点的字幕块，顺序为从下往上：译文在下、原文在上。"""
-        mode = self.subtitle_language_var.get()
-        original = self.original_entries or self.entries
-        current = None
-        for index, entry in enumerate(original):
-            if entry["start_ms"] <= seconds * 1000 < entry["end_ms"]:
-                current = index
-                break
-        if current is None:
-            return []
-        translated_text = ""
-        if current < len(self.translated):
-            translated_text = str(self.translated[current].get("text") or "")
-        blocks: list[dict] = []
-        if mode == "译文":
-            block = (self._plain_block(translated_text)
-                     or self._entry_block(original[current]))
-            if block is not None:
-                blocks.append(block)
-        elif mode == "双语":
-            translated_block = self._plain_block(translated_text)
-            if translated_block is not None:
-                blocks.append(translated_block)
-            source_block = self._entry_block(original[current])
-            if source_block is not None:
-                blocks.append(source_block)
-        else:
-            source_block = self._entry_block(original[current])
-            if source_block is not None:
-                blocks.append(source_block)
-        return blocks
-
-    @staticmethod
-    def _wrap_caption_lines(draw, block: dict, font_px: int, family: str,
-                            available: float) -> list[list[dict]]:
-        """按可用宽度在字符级换行，保留原有 \\N 换行与内联样式。"""
-        lines: list[list[dict]] = []
-        for source_line in block.get("lines") or []:
-            current: list[dict] = []
-            current_width = 0.0
-            for run in source_line:
-                text = str(run.get("text") or "")
-                if not text:
-                    continue
-                bold = bool(run.get("bold") or block.get("bold"))
-                italic = bool(run.get("italic") or block.get("italic"))
-                font = preview_font(font_px, bold, family, needs_cjk(text))
-                if font is None:
-                    continue
-                for char in text:
-                    char_width = draw.textlength(char, font=font)
-                    if current and current_width + char_width > available:
-                        lines.append(current)
-                        current = []
-                        current_width = 0.0
-                    if (current and current[-1]["bold"] == bold
-                            and current[-1]["italic"] == italic
-                            and current[-1].get("underline") == run.get("underline")
-                            and current[-1].get("colour") == run.get("colour")):
-                        current[-1]["text"] += char
-                    else:
-                        current.append({"text": char, "bold": bold, "italic": italic,
-                                        "underline": run.get("underline"),
-                                        "colour": run.get("colour")})
-                    current_width += char_width
-            lines.append(current)
-        return lines
-
-    def _draw_caption_blocks(self, image, draw, width: int, height: int,
-                             blocks: list[dict]) -> float:
-        """从下往上依次绘制字幕块，返回最上方块的可用底边（供后续块继续堆叠）。"""
-        bottom = float(height) - self.px(8)
-        if Image is None or ImageDraw is None:
-            return bottom
-        default_size = max(self.px(15), int(height * 0.042))
-        for block in blocks:
-            bottom = self._draw_caption_block(image, draw, width, height, block,
-                                              default_size, bottom)
-        return bottom
-
-    def _draw_caption_block(self, image, draw, width: int, height: int, block: dict,
-                            default_size: int, bottom_limit: float) -> float:
-        pil_image, pil_draw = Image, ImageDraw
-        if pil_image is None or pil_draw is None:   # 防御性检查（调用方已拦截）+ 类型收窄
-            return bottom_limit
-        res_x = int(block.get("res_x") or 0)
-        res_y = int(block.get("res_y") or 0)
-        scale_y = (height / res_y) if res_y else 1.0
-        scale_x = (width / res_x) if res_x else scale_y
-        size = float(block.get("size") or 0.0)
-        font_px = max(10, min(int(round(size * scale_y)) if size else default_size,
-                              int(height * 0.4)))
-        border = max(0.0, float(block.get("border") or 0.0)) * (scale_y if res_y else 1.0)
-        stroke = int(round(border)) if border >= 0.5 else 0
-        family = str(block.get("family") or "")
-        outline = tuple(block.get("outline") or (17, 25, 20))
-        primary = tuple(block.get("primary") or (255, 255, 255))
-        if res_x:
-            margin_l = float(block.get("margin_l") or 0.0) * scale_x
-            margin_r = float(block.get("margin_r") or 0.0) * scale_x
-            margin_v = float(block.get("margin_v") or 0.0) * scale_y
-        else:
-            margin_l = margin_r = 0.0
-            margin_v = self.px(18)
-        alignment = int(block.get("alignment") or 2)
-        if not 1 <= alignment <= 9:
-            alignment = 2
-        available = max(self.px(40), width - margin_l - margin_r - self.px(12))
-        lines = self._wrap_caption_lines(draw, block, font_px, family, available)
-        spacing = max(2, int(font_px * 0.18))
-        prepared = []
-        for line in lines:
-            runs = []
-            line_width = 0.0
-            line_height = float(font_px)
-            for run in line:
-                font = preview_font(font_px, run["bold"], family, needs_cjk(run["text"]))
-                if font is None:
-                    continue
-                bounds = draw.textbbox((0, 0), run["text"], font=font, stroke_width=stroke)
-                run_width = float(bounds[2] - bounds[0])
-                line_height = max(line_height, float(bounds[3] - bounds[1]))
-                runs.append((run, font, run_width))
-                line_width += run_width
-            prepared.append((runs, line_width, line_height) if runs else None)
-        if not any(prepared):
-            return bottom_limit
-        block_width = max(item[1] for item in prepared if item)
-        block_height = (sum(item[2] for item in prepared if item)
-                        + spacing * max(0, len(prepared) - 1))
-        column = (alignment - 1) % 3                 # 0=左 1=中 2=右
-        row = (alignment - 1) // 3                   # 0=下 1=中 2=上
-        if column == 0:
-            x = margin_l + self.px(6)
-        elif column == 2:
-            x = width - margin_r - block_width - self.px(6)
-        else:
-            x = (width - block_width) / 2.0
-        if row == 0:
-            y = bottom_limit - margin_v - block_height
-        elif row == 1:
-            y = (height - block_height) / 2.0
-        else:
-            y = margin_v
-        x = max(self.px(4), min(x, max(self.px(4), width - block_width - self.px(4))))
-        y = max(self.px(4), min(y, max(self.px(4), height - block_height - self.px(4))))
-        if block.get("background", True) and block_width > 0:
-            pad_x, pad_y = self.px(8), self.px(5)
-            draw.rounded_rectangle(
-                (x - pad_x, y - pad_y, x + block_width + pad_x, y + block_height + pad_y),
-                radius=self.px(5), fill=(0, 0, 0, 128))
-        line_y = y
-        affine = getattr(pil_image, "AFFINE", 0)
-        for item in prepared:
-            if item is None:
-                line_y += spacing
-                continue
-            runs, line_width, line_height = item
-            run_x = x + (block_width - line_width) / 2.0
-            for run, font, run_width in runs:
-                fill = tuple(run.get("colour") or primary) + (255,)
-                if run.get("italic"):
-                    pad = self.px(8)
-                    layer = pil_image.new("RGBA",
-                                          (int(run_width) + pad * 2,
-                                           int(line_height) + pad * 2), (0, 0, 0, 0))
-                    pil_draw.Draw(layer).text((pad, pad), run["text"], font=font,
-                                              fill=fill, stroke_width=stroke,
-                                              stroke_fill=outline + (255,))
-                    shear = 0.22
-                    shifted = int(layer.height * shear)
-                    layer = layer.transform((layer.width + shifted, layer.height),
-                                            affine, (1, shear, -shifted, 0, 1, 0),
-                                            resample=pil_image.BILINEAR)
-                    image.alpha_composite(layer, (int(run_x) - pad, int(line_y) - pad))
-                else:
-                    draw.text((run_x, line_y), run["text"], font=font, fill=fill,
-                              stroke_width=stroke, stroke_fill=outline + (255,))
-                if run.get("underline"):
-                    underline_y = line_y + line_height
-                    draw.line((run_x, underline_y, run_x + run_width, underline_y),
-                              fill=fill, width=max(1, int(font_px * 0.06)))
-                run_x += run_width
-            line_y += line_height + spacing
-        return y - spacing
-
-    def _render_video_frame(self):
-        if self.current_frame is None or cv2 is None:
-            return
-        if Image is None or ImageTk is None or ImageDraw is None:
-            return
-        canvas_width = max(2, self.preview_canvas.winfo_width())
-        canvas_height = max(2, self.preview_canvas.winfo_height())
-        frame_height, frame_width = self.current_frame.shape[:2]
-        ratio = min(canvas_width / frame_width, canvas_height / frame_height)
-        width = max(1, round(frame_width * ratio))
-        height = max(1, round(frame_height * ratio))
-        interpolation = cv2.INTER_AREA if ratio < 1 else cv2.INTER_LINEAR
-        frame = cv2.resize(self.current_frame, (width, height), interpolation=interpolation)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        blocks = self._caption_blocks_for(self.position_var.get())
-        if blocks:
-            signature = (width, height, self.subtitle_language_var.get(),
-                         tuple(run["text"] for block in blocks
-                               for line in block["lines"] for run in line))
-            cache = self._caption_cache
-            if cache.get("key") != signature:
-                overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                self._draw_caption_blocks(overlay, ImageDraw.Draw(overlay, "RGBA"),
-                                          width, height, blocks)
-                cache = self._caption_cache = {"key": signature, "image": overlay}
-            raster = Image.fromarray(frame_rgb).convert("RGBA")
-            raster.alpha_composite(cache["image"])
-            raster = raster.convert("RGB")
-        else:
-            raster = Image.fromarray(frame_rgb)
-        if self._photo_image is None or self._photo_size != (width, height):
-            self._photo_image = ImageTk.PhotoImage(raster)
-            self._photo_size = (width, height)
-        else:
-            self._photo_image.paste(raster)
-        self.preview_photo = self._photo_image
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(canvas_width // 2, canvas_height // 2,
-                                         image=self._photo_image, anchor="center")
-
-    def _stop_rendered_audio_preview(self):
-        process = self.preview_audio_process
-        if process is None:
-            return
-        self.preview_audio_process = None
-        try:
-            process.terminate()
-            process.wait(timeout=1)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-    def _start_audio(self, seconds: float):
-        """启动音频：优先可查询的音频主时钟（mpv → waveOut），否则退回 ffplay + 墙钟。"""
-        self._stop_audio()
-        position = max(0.0, float(seconds or 0.0))
-        if not self.audio_tracks:
-            self._audio_clock_kind = ""
-            return
-        ordinal = self._selected_audio_ordinal()
-        clock = create_audio_clock(self.media_path, find_binary("ffmpeg"), ordinal)
-        if clock is not None and clock.start(position):
-            self.audio_clock = clock
-            self._audio_clock_kind = clock.name
-            self._append_log(f"播放时钟：{clock.name}（音频主时钟，音轨 "
-                             f"{ordinal + 1}，画面跟随音频）")
-            return
-        self.audio_clock = None
-        self._audio_clock_kind = "ffplay"
-        self._start_rendered_audio_preview()
-        detail = getattr(clock, "error", "") if clock is not None else ""
-        self._append_log("播放时钟：ffplay + 墙钟（未找到可查询的音频时钟"
-                         + (f"：{detail}" if detail else "") + "）"
-                         + "；音画不同步时请用「同步」微调")
-
-    def _stop_audio(self):
-        clock, self.audio_clock = self.audio_clock, None
-        self._audio_clock_kind = ""
-        if clock is not None:
-            try:
-                clock.stop()
-            except Exception:
-                pass
-        self._stop_rendered_audio_preview()
-
-    def _start_rendered_audio_preview(self):
-        """用 ffplay 只播放音频（-vn 不解码视频），画面由画布按墙钟驱动。"""
-        self._stop_rendered_audio_preview()
-        ffplay = find_binary("ffplay")
-        if not ffplay or self.media_path is None:
-            return
-        position = max(0.0, self.position_var.get())
-        command = [ffplay, "-hide_banner", "-loglevel", "error", "-nostats",
-                   "-autoexit", "-nodisp", "-vn",
-                   "-ast", f"a:{self._selected_audio_ordinal()}",
-                   "-ss", f"{position:.3f}", "-i", str(self.media_path)]
-        try:
-            self.preview_audio_process = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except OSError:
-            self.preview_audio_process = None
-
-    def _fit_preview_canvas(self):
-        canvas = getattr(self, "preview_canvas", None)
-        stage = getattr(self, "preview_stage", None)
-        if canvas is None or stage is None:
-            return
-        max_width = max(2, stage.winfo_width() - self.px(24))
-        max_height = max(2, stage.winfo_height() - self.px(24))
-        if self.current_frame is not None:
-            frame_height, frame_width = self.current_frame.shape[:2]
-        else:
-            frame_width, frame_height = 16, 9
-        scale = min(max_width / frame_width, max_height / frame_height)
-        width = max(2, int(round(frame_width * scale)))
-        height = max(2, int(round(frame_height * scale)))
-        if (int(canvas.cget("width")), int(canvas.cget("height"))) != (width, height):
-            canvas.configure(width=width, height=height)
-
-    def _resize_video_canvas(self, _event=None):
-        self._fit_preview_canvas()
-        if self.current_frame is not None:
-            self._render_video_frame()
-        elif self._preview_message:
-            self._draw_preview_placeholder(self._preview_message)
-
-    def _close_video(self):
-        self.video_playing = False
-        set_precise_timers(False)
-        self._stop_audio()
-        if self.video_after is not None:
-            try:
-                self.root.after_cancel(self.video_after)
-            except tk.TclError:
-                pass
-            self.video_after = None
-        if self.video_capture is not None:
-            self.video_capture.release()
-            self.video_capture = None
-        self.current_frame = None
-        self._caption_cache = {}
-        self._photo_image = None
-        self._photo_size = None
-        if hasattr(self, "play_button"):
-            self.play_button.configure(text="▶ 播放")
-
-    def _close_window(self):
-        self._closing = True
-        if self._plan_cancel is not None:
-            self._plan_cancel.set()
-        for handle in (getattr(self, "_poll_after", None), getattr(self, "_dpi_after", None)):
-            if handle is not None:
-                try:
-                    self.root.after_cancel(handle)
-                except tk.TclError:
-                    pass
-        self._close_video()
-        self.root.destroy()
-
-    def _start_transcription(self):
-        if self.busy:
-            return
-        if self.media_path is None or not self.audio_tracks:
-            messagebox.showinfo("需要媒体", "请先载入包含音轨的媒体文件。")
-            return
-        ordinal = self._selected_audio_ordinal()
-        model = self.whisper_model_var.get()
-        choice = self.asr_language_var.get()
-        whisper_lang = "" if choice == "自动检测" else WHISPER_LANGUAGE_CODES.get(choice, "")
-        self.asr_status_var.set("正在准备识别…")
-        self._append_log(f"开始识别：Whisper {model} · 音轨 {ordinal + 1} · 语言 {choice}")
-        self._run_worker("准备本地 Whisper…", self._transcribe_worker,
-                         ordinal, model, whisper_lang)
-
-    def _transcribe_worker(self, ordinal: int, model: str, language: str):
-        media_path = self.media_path
-        if media_path is None:
-            raise StudioError("请先载入媒体文件。")
-        with tempfile.TemporaryDirectory(prefix="media_asr_") as temp_dir:
-            audio = Path(temp_dir) / "audio.wav"
-            self.events.put(("status", "正在抽取所选音轨为 16 kHz 单声道…"))
-            audio_to_wav(media_path, ordinal, audio)
-            entries = transcribe_audio(audio, model, language,
-                                       progress=lambda text: self.events.put(("status", text)),
-                                       label="识别")
-        return {"entries": entries, "model": model, "ordinal": ordinal}
-
-    def _context_line_count(self, report: bool = False) -> int | None:
-        """读取「上下文句数」；非法时返回 None（report=True 时弹提示）。"""
-        try:
-            value = int(float(self.context_lines_var.get()))
-        except (TypeError, ValueError):
-            if report:
-                messagebox.showerror("参数无效", "上下文句数必须是整数。")
-            return None
-        if not 0 <= value <= CONTEXT_LINES_MAX:
-            if report:
-                messagebox.showerror(
-                    "参数无效",
-                    f"上下文句数必须在 0~{CONTEXT_LINES_MAX} 之间（0 = 关闭）。")
-            return None
-        return value
-
-    def _start_translation(self):
-        if self.busy:
-            return
-        if not self.entries:
-            messagebox.showinfo("没有字幕", "请先载入字幕，或先识别一个音轨。")
-            return
-        if not translation_models():
-            messagebox.showerror("缺少配置",
-                                 f"未找到可用的 AI 模型配置：{subtitles.get_config_path()}")
-            return
-        try:
-            max_concurrent = int(float(self.translation_concurrency_var.get()))
-            batch_size = (int(float(self.batch_size_var.get()))
-                          if self.group_translation_var.get() else 0)
-        except (TypeError, ValueError):
-            messagebox.showerror("参数无效", "并发数和每组行数必须是整数。")
-            return
-        if not 1 <= max_concurrent <= self.MAX_CONCURRENT:
-            messagebox.showerror("参数无效",
-                                 f"并发数必须在 1~{self.MAX_CONCURRENT} 之间。")
-            return
-        if self.group_translation_var.get() and not (
-                subtitles.BATCH_SIZE_MIN <= batch_size <= subtitles.BATCH_SIZE_MAX):
-            messagebox.showerror(
-                "参数无效",
-                f"每组行数必须在 {subtitles.BATCH_SIZE_MIN}~{subtitles.BATCH_SIZE_MAX} 之间。",
-            )
-            return
-        context_lines = self._context_line_count(report=True)
-        if context_lines is None:
-            return
-        model_name = self.translation_model_var.get()
-        source, target = self.source_var.get(), self.target_var.get()
-        mode_text = f"分组 {batch_size} 行/批" if batch_size else "逐条"
-        self.translate_cancel_event = threading.Event()
-        self._set_translate_running(True)
-        self._append_log(
-            f"开始翻译：{model_name} · 并发 {max_concurrent} · {mode_text} · "
-            f"上下文 ±{context_lines} 条 · {source} → {target}")
-        self._run_worker("正在调用 AI 翻译…", self._translate_worker,
-                         model_name, source, target, max_concurrent, batch_size,
-                         context_lines)
-
-    def _cancel_translation(self):
-        if self.translate_cancel_event is not None:
-            self.translate_cancel_event.set()
-        self.cancel_translate_button.configure(state="disabled")
-        self.status_var.set("正在取消翻译：等待在途请求返回…")
-        self._append_log("已请求取消；等待在途请求结束后停止（完成的部分不会写入字幕）。")
-
-    def _translate_worker(self, model_name: str, source: str, target: str,
-                          max_concurrent: int, batch_size: int, context_lines: int):
-        entries = copy.deepcopy(self.original_entries or self.entries)
-        translated, cancelled = translated_entries(
-            entries, source, target, model_name,
-            progress=lambda done, total: self.events.put(("progress", done, total)),
-            log=lambda text: self.events.put(("log", text)),
-            max_concurrent=max_concurrent, batch_size=batch_size,
-            context_lines=context_lines,
-            cancel_event=self.translate_cancel_event,
-        )
-        try:
-            tokens = subtitles.get_token_stats()[2]
-        except Exception:
-            tokens = 0
-        return {"translated": translated, "cancelled": cancelled,
-                "tokens": tokens, "total": len(translated)}
-
-    def _set_translate_running(self, running: bool):
-        self.translate_running = running
-        if running:
-            self.translate_progress.configure(maximum=1, value=0)
-            self.cancel_translate_button.configure(state="normal")
-            self.translate_progress_var.set("正在准备翻译任务…")
-        else:
-            self.cancel_translate_button.configure(state="disabled")
-
-    def _on_translate_progress(self, done: int, total: int):
-        total = max(1, int(total))
-        done = max(0, min(int(done), total))
-        self.translate_progress.configure(maximum=total, value=done)
-        self.translate_progress_var.set(f"已翻译 {done}/{total} 条（{done * 100 // total}%）")
-
-    def _toggle_group_translation(self):
-        state = "normal" if self.group_translation_var.get() else "disabled"
-        self.batch_size_spinbox.configure(state=state)
-        self._update_translate_hint()
-
-    def _refresh_translation_models(self):
-        if getattr(self, "translation_model_box", None) is None:
-            return
-        models = translation_models()
-        names = [item["name"] for item in models]
-        self.translation_model_box["values"] = names
-        current = self.translation_model_var.get()
-        if current not in names:
-            current = default_translation_model()
-            self.translation_model_var.set(current)
-        detail = translation_model_by_name(current)
-        changed = current != self._last_translation_model
-        self._last_translation_model = current
-        if detail:
-            per_model = model_concurrency(detail)
-            self.model_detail_var.set(
-                f"{detail.get('model', '未知模型')} · 模型配置默认并发 {per_model}")
-            if changed:
-                self.translation_concurrency_var.set(str(per_model))
-        else:
-            self.model_detail_var.set("未找到 api_settings.json 中的模型配置。")
-        self._update_translate_hint()
-
-    def _on_translation_model_change(self, _event=None):
-        self._refresh_translation_models()
-        self._append_log(f"翻译模型已切换为：{self.translation_model_var.get()}")
-
-    def _start_export(self):
-        """① 只导出单个字幕文件（外挂），与压制设置完全无关。"""
-        if self.busy:
-            return
-        media_path = self.media_path
-        if media_path is None:
-            messagebox.showinfo("需要媒体", "请先载入媒体文件。")
-            return
-        language_mode = self.subtitle_language_var.get()
-        original = copy.deepcopy(self.original_entries or self.entries)
-        translated = copy.deepcopy(self.translated)
-        if not original:
-            messagebox.showinfo("没有字幕", "请先载入或识别字幕。")
-            return
-        if language_mode in {"译文", "双语"} and not translated:
-            messagebox.showinfo("没有译文", "请先翻译字幕，或选择原文输出。")
-            return
-        self._append_log(f"导出字幕文件：{self.subtitle_format_var.get()} · {language_mode}")
-        self._run_worker(
-            "正在导出字幕文件…", self._export_worker, str(media_path),
-            self.subtitle_format_var.get().lower(), language_mode, original, translated)
-
-    def _mux_options(self) -> dict:
-        """压制时的重复检查设置（快照，后台线程用）。"""
-        return {"check_duplicates": bool(self.mux_check_var.get()),
-                "duplicate_threshold": self._mux_threshold(),
-                "check_ai": True,
-                "ai_model": self.translation_model_var.get()}
-
-    def _start_mux(self):
-        """② 压制字幕（只处理压制，与单文件导出互不影响）。"""
-        if self.busy:
-            return
-        media_path = self.media_path
-        if media_path is None:
-            messagebox.showinfo("需要媒体", "请先载入媒体文件。")
-            return
-        original = copy.deepcopy(self.original_entries or self.entries)
-        translated = copy.deepcopy(self.translated)
-        mux_tracks = self._mux_track_specs()
-        try:
-            normalize_export_tracks(mux_tracks)
-        except StudioError as exc:
-            messagebox.showerror("字幕轨无效", str(exc))
-            return
-        if mux_tracks:
-            needs_original = any(item["kind"] == "generated" for item in mux_tracks)
-            needs_translated = any(item["kind"] == "generated" and item["mode"] != "原文"
-                                   for item in mux_tracks)
-        else:
-            mode = self.subtitle_language_var.get()
-            needs_original, needs_translated = True, mode in {"译文", "双语"}
-        if needs_original and not original:
-            messagebox.showinfo("没有字幕", "请先载入或识别字幕。")
-            return
-        if needs_translated and not translated:
-            messagebox.showinfo("没有译文", "请先翻译字幕，或改为压制原文。")
-            return
-        drop_subtitles = self._selected_drop_subtitles()
-        threshold = self._mux_threshold()
-        self._append_log(
-            f"开始压制：{len(mux_tracks) if mux_tracks else 1} 条字幕轨"
-            + (f" · 删除 {len(drop_subtitles)} 条内嵌字幕" if drop_subtitles else "")
-            + (f" · 重复检查开（≥{threshold}%）" if self.mux_check_var.get()
-               else " · 重复检查关"))
-        self._run_worker(
-            "正在压制字幕…", self._mux_worker, str(media_path),
-            self.subtitle_format_var.get().lower(),
-            self.subtitle_language_var.get(), original, translated,
-            drop_subtitles, mux_tracks, self._mux_options())
-
-    def _export_worker(self, media_path: str, format_name: str,
-                       language_mode: str, original: list[dict],
-                       translated: list[dict]) -> list[Path]:
-        return export_subtitles(media_path, format_name, "外挂字幕", language_mode,
-                                original, translated)
-
-    def _mux_worker(self, media_path: str, format_name: str, language_mode: str,
-                    original: list[dict], translated: list[dict],
-                    drop_subtitles=None, mux_tracks=None, options=None) -> dict:
-        """压制（带重复检查）：返回 {"outputs": [...], "dropped": [...], "tokens": int}。"""
-        options = dict(options or {})
-        token_before = int(subtitles.get_token_stats()[2])
-        candidates: list[dict] = []
-        tracks = mux_tracks or [{"kind": "generated", "mode": language_mode,
-                                 "language": None, "title": language_mode}]
-        tracks, missing_tracks = resolve_export_tracks(
-            media_path, tracks, log=lambda text: self.events.put(("log", text)))
-        if not tracks:
-            raise StudioError(
-                "没有可压制的字幕轨：\n"
-                + "\n".join(f"· {item['label']}：{item['reason']}" for item in missing_tracks))
-        for position, track in enumerate(tracks, 1):
-            if str(track.get("kind") or "") == "external":
-                item_label = f"外部字幕 {Path(str(track.get('path'))).name}"
-            else:
-                item_label = f"生成的字幕·{track.get('mode') or '原文'}"
-            candidates.append({"key": position, "label": item_label, "spec": track,
-                               "entries": _plan_track_contents(track, original, translated)})
-        dropped: list[dict] = []
-        if candidates and options.get("check_duplicates", True):
-            outcome = check_mux_tracks(
-                Path(media_path), candidates,
-                threshold=options.get("duplicate_threshold", DUPLICATE_THRESHOLD_DEFAULT),
-                use_ai=bool(options.get("check_ai", True)),
-                model_name=options.get("ai_model"),
-                log=lambda text: self.events.put(("log", text)))
-            candidates, dropped = outcome["keep"], outcome["dropped"]
-            if not candidates:
-                raise StudioError(
-                    "待压字幕与视频里已有字幕同语言且内容雷同，已全部去掉：\n"
-                    + "\n".join(f"· {item['label']} ≈ {item['target']}"
-                                f"（{item['ratio']:.0%}）" for item in dropped))
-        outputs = export_subtitles(
-            media_path, format_name, "内嵌字幕", language_mode, original, translated,
-            drop_subtitles=drop_subtitles,
-            mux_tracks=[item["spec"] for item in candidates] or None)
-        tokens = int(subtitles.get_token_stats()[2]) - token_before
-        return {"outputs": outputs, "dropped": dropped, "tokens": max(0, tokens)}
-
-    # ------------------------------------------------------------- 计划任务
-    def _plan_add_step(self, kind: str, page: str, detail: str, settings: dict):
-        """把当前页面的设置记为一个计划步骤（按加入顺序依次执行）。"""
-        if self.plan_running:
-            self.status_var.set("计划正在执行，暂时不能修改计划。")
-            return
-        step = {"kind": kind, "page": page, "detail": detail,
-                "label": f"{page} · {detail}", "settings": settings}
-        self._plan_steps.append(step)
-        self._refresh_plan_tree(select=len(self._plan_steps) - 1)
-        self._append_log(f"已加入计划：{step['label']}")
-        self.status_var.set(f"已加入计划（共 {len(self._plan_steps)} 步）：{detail}")
-
-    def _plan_add_asr(self):
-        model = self.whisper_model_var.get()
-        choice = self.asr_language_var.get()
-        ordinal = self._selected_audio_ordinal()
-        settings = {
-            "model": model,
-            "language": choice,
-            "whisper_language": ("" if choice == "自动检测"
-                                 else WHISPER_LANGUAGE_CODES.get(choice, "")),
-            "audio_ordinal": ordinal,
-        }
-        detail = f"Whisper {model} · 音轨 {ordinal + 1} · 语言 {choice}"
-        self._plan_add_step("asr", "识别", detail, settings)
-
-    def _plan_add_translate(self):
-        if not translation_models():
-            messagebox.showerror("缺少配置",
-                                 f"未找到可用的 AI 模型配置：{subtitles.get_config_path()}")
-            return
-        try:
-            max_concurrent = int(float(self.translation_concurrency_var.get()))
-            batch_size = (int(float(self.batch_size_var.get()))
-                          if self.group_translation_var.get() else 0)
-        except (TypeError, ValueError):
-            messagebox.showerror("参数无效", "并发数和每组行数必须是整数。")
-            return
-        if not 1 <= max_concurrent <= self.MAX_CONCURRENT:
-            messagebox.showerror("参数无效",
-                                 f"并发数必须在 1~{self.MAX_CONCURRENT} 之间。")
-            return
-        if self.group_translation_var.get() and not (
-                subtitles.BATCH_SIZE_MIN <= batch_size <= subtitles.BATCH_SIZE_MAX):
-            messagebox.showerror(
-                "参数无效",
-                f"每组行数必须在 {subtitles.BATCH_SIZE_MIN}~"
-                f"{subtitles.BATCH_SIZE_MAX} 之间。")
-            return
-        context_lines = self._context_line_count(report=True)
-        if context_lines is None:
-            return
-        settings = {
-            "model_name": self.translation_model_var.get(),
-            "source": self.source_var.get(),
-            "target": self.target_var.get(),
-            "concurrency": max_concurrent,
-            "batch_size": batch_size,
-            "context_lines": context_lines,
-        }
-        mode = f"分组 {batch_size} 行/批" if batch_size else "逐条"
-        detail = (f"{settings['model_name']} · 并发 {max_concurrent} · {mode} · "
-                  f"上下文 ±{context_lines} · "
-                  f"{settings['source']} → {settings['target']}")
-        self._plan_add_step("translate", "翻译", detail, settings)
-
-    def _plan_add_export(self):
-        """加入计划：只导出单个字幕文件。"""
-        settings = {
-            "format": self.subtitle_format_var.get().lower(),
-            "language": self.subtitle_language_var.get(),
-            "mode": "file",
-        }
-        detail = f"{settings['format'].upper()} · 字幕文件 · {settings['language']}"
-        self._plan_add_step("export", "导出", detail, settings)
-
-    def _plan_add_mux(self):
-        """加入计划：压制字幕轨（含重复检查设置）。"""
-        mux_tracks = self._mux_track_specs()
-        try:
-            normalize_export_tracks(mux_tracks)
-        except StudioError as exc:
-            messagebox.showerror("字幕轨无效", str(exc))
-            return
-        drop_subtitles = self._selected_drop_subtitles()
-        threshold = self._mux_threshold()
-        check_on = bool(self.mux_check_var.get())
-        settings = {
-            "format": self.subtitle_format_var.get().lower(),
-            "drop_subtitles": drop_subtitles,
-            "mux_tracks": mux_tracks,
-            "check_duplicates": check_on,
-            "duplicate_threshold": threshold,
-        }
-        detail = f"{settings['format'].upper()} · 压制"
-        if mux_tracks:
-            labels = [self._mux_track_label(track) for track in self._mux_tracks]
-            shown = "、".join(labels[:2]) + ("…" if len(labels) > 2 else "")
-            detail += f" · {len(labels)} 条字幕轨（{shown}）"
-            bound = sum(1 for item in mux_tracks if item.get("bind"))
-            if bound:
-                detail += f" · {bound} 条按文件名关系自动匹配"
-        if drop_subtitles:
-            detail += f" · 删除 {len(drop_subtitles)} 条内嵌字幕"
-        detail += f" · 重复检查{'开 ≥' + str(threshold) + '%' if check_on else '关'}"
-        self._plan_add_step("mux", "压制", detail, settings)
-
-    def _refresh_plan_tree(self, select: int | None = None):
-        tree = getattr(self, "plan_tree", None)
-        if tree is None:
-            return
-        tree.delete(*tree.get_children())
-        for index, step in enumerate(self._plan_steps):
-            tree.insert("", "end", iid=str(index),
-                        values=(index + 1, step.get("page"), step.get("detail")),
-                        tags=("odd" if index % 2 else "even",))
-        if select is not None and 0 <= select < len(self._plan_steps):
-            tree.selection_set(str(select))
-            tree.see(str(select))
-
-    def _refresh_plan_files_tree(self, select: int | None = None):
-        """重建文件列表：每个文件下面挂本次执行中它的各步骤（状态 + token）。"""
-        tree = getattr(self, "plan_files_tree", None)
-        if tree is None:
-            return
-        tree.delete(*tree.get_children())
-        for index, path in enumerate(self._plan_files):
-            status = self._plan_status.get(str(path), "待处理")
-            if status.startswith("处理中"):
-                tag = "running"
-            elif status.startswith("完成"):
-                tag = "done"
-            elif status.startswith("失败"):
-                tag = "failed"
-            elif status.startswith("跳过"):
-                tag = "skipped"
-            else:
-                tag = "odd" if index % 2 else "even"
-            steps = self._plan_file_steps.get(str(path)) or []
-            total = sum(int(item.get("tokens") or 0) for item in steps)
-            tree.insert("", "end", iid=str(index), open=bool(steps),
-                        values=(index + 1, path.name, status,
-                                f"{total:,}" if total else "—"), tags=(tag,))
-            for item in steps:
-                tokens = int(item.get("tokens") or 0)
-                tree.insert(str(index), "end", iid=f"{index}.{item['order']}",
-                            values=(f"{index + 1}.{item['order']}",
-                                    f"　{item.get('label') or ''}",
-                                    item.get("status") or "",
-                                    f"{tokens:,}" if tokens else "—"),
-                            tags=("step",))
-        if select is not None and 0 <= select < len(self._plan_files):
-            tree.selection_set(str(select))
-            tree.see(str(select))
-
-    def _plan_selection(self, tree_name: str) -> int | None:
-        tree = getattr(self, tree_name, None)
-        if tree is None:
-            return None
-        try:
-            return int(tree.selection()[0])
-        except (IndexError, ValueError):
-            return None
-
-    def _plan_set_status(self, path: Path, status: str):
-        self._plan_status[str(path)] = status
-        self._refresh_plan_files_tree()
-
-    def _plan_move_step(self, delta: int):
-        if self.plan_running:
-            return
-        index = self._plan_selection("plan_tree")
-        if index is None:
-            self.status_var.set("请先在计划列表里选择一个步骤。")
-            return
-        target = index + delta
-        if not 0 <= target < len(self._plan_steps):
-            return
-        steps = self._plan_steps
-        steps[index], steps[target] = steps[target], steps[index]
-        self._refresh_plan_tree(select=target)
-
-    def _plan_remove_step(self):
-        if self.plan_running:
-            return
-        index = self._plan_selection("plan_tree")
-        if index is None:
-            self.status_var.set("请先在计划列表里选择一个步骤。")
-            return
-        removed = self._plan_steps.pop(index)
-        self._refresh_plan_tree(select=min(index, len(self._plan_steps) - 1))
-        self._append_log(f"已从计划移除：{removed.get('label')}")
-
-    def _plan_clear_steps(self):
-        if self.plan_running or not self._plan_steps:
-            return
-        self._plan_steps = []
-        self._refresh_plan_tree()
-        self._append_log("计划步骤已清空。")
-
-    def _plan_add_files(self, paths) -> int:
-        added = 0
-        if self.plan_running:
-            return 0
-        for item in paths:
-            path = Path(item)
-            try:
-                if path.suffix.lower() not in MEDIA_EXTENSIONS or not path.is_file():
-                    continue
-            except OSError:
-                continue
-            if path in self._plan_files:
-                continue
-            self._plan_files.append(path)
-            added += 1
-        if added:
-            self._refresh_plan_files_tree()
-            self.status_var.set(f"已加入 {added} 个文件（共 {len(self._plan_files)} 个）")
-        return added
-
-    def _plan_choose_files(self):
-        paths = filedialog.askopenfilenames(
-            title="选择要处理的媒体文件（可多选）",
-            filetypes=[("媒体文件",
-                        "*." + " *.".join(sorted(ext[1:] for ext in MEDIA_EXTENSIONS))),
-                       ("所有文件", "*.*")],
-        )
-        if not paths:
-            return
-        if not self._plan_add_files(paths):
-            self.status_var.set("没有加入新文件（已存在或不是媒体文件）")
-
-    def _plan_add_current(self):
+        self._populate_subtitles()
+        self._set_status(f"字幕已载入：{len(entries)} 条")
+
+    def _populate_subtitles(self):
+        entries = self.original_entries or self.entries
+        self.subtitle_model.set_entries(entries)
+        self._subtitle_starts = [int(item.get("start_ms") or 0) for item in entries]
+        self._caption_cache.clear()
+        self.entry_stats.setText(f"{len(entries):,} 条")
+
+    def _update_export_hint(self, *_args):
         if self.media_path is None:
-            self.status_var.set("还没有载入媒体文件。")
+            self.export_hint.setText("载入媒体后显示预计输出文件名")
+            self.mux_hint.setText("封装会生成新媒体文件，不覆盖输入文件。")
             return
-        if not self._plan_add_files([self.media_path]):
-            self.status_var.set(f"{self.media_path.name} 已在计划文件列表中。")
+        mode_suffix = {"原文": "original", "译文": "translated", "双语": "bilingual"}
+        suffix = mode_suffix.get(self.export_language.currentText(), "original")
+        output = self.media_path.with_name(
+            f"{self.media_path.stem}_{suffix}.{self.export_format.currentText().lower()}")
+        self.export_hint.setText(f"预计外挂字幕：{output}")
+        has_video = any(item.get("codec_type") == "video"
+                        for item in self.media_info.get("streams", []))
+        container = ".mkv" if has_video else ".mka"
+        generated = sum(item.get("kind") == "generated" for item in self.mux_tracks)
+        external = sum(item.get("kind") == "external" for item in self.mux_tracks)
+        preserve = "保留" if self.keep_existing.isChecked() else "按轨道勾选移除"
+        self.mux_hint.setText(
+            f"预计封装：{self.media_path.stem}_subtitled{container} · "
+            f"新增 {generated + external} 条（生成 {generated} / 外挂 {external}）· {preserve}")
 
-    def _plan_remove_file(self):
-        if self.plan_running:
+    def _subtitle_selected(self, index):
+        if index.isValid() and self._video_duration:
+            entry = (self.original_entries or self.entries)[index.row()]
+            self.seek_video(int(10000 * max(0, entry["start_ms"]) / (self._video_duration * 1000)))
+
+    def jump_entry(self, direction):
+        entries = self.original_entries or self.entries
+        if not entries or self._video is None:
             return
-        index = self._plan_selection("plan_files_tree")
-        if index is None:
-            self.status_var.set("请先在文件列表里选择一个文件。")
-            return
-        removed = self._plan_files.pop(index)
-        self._plan_status.pop(str(removed), None)
-        self._refresh_plan_files_tree(select=min(index, len(self._plan_files) - 1))
-        self.status_var.set(f"已从计划移除文件：{removed.name}")
-
-    def _plan_clear_files(self):
-        if self.plan_running or not self._plan_files:
-            return
-        self._plan_files = []
-        self._plan_status = {}
-        self._refresh_plan_files_tree()
-        self.status_var.set("计划文件列表已清空。")
-
-    def _start_plan(self):
-        if self.busy or self.plan_running:
-            return
-        if not self._plan_steps:
-            messagebox.showerror("计划为空",
-                                 "请先在「识别 / 翻译 / 导出与封装」页面把设置加入计划。")
-            return
-        if not self._plan_files:
-            messagebox.showerror("没有文件", "请先添加要处理的媒体文件，可一次选择多个。")
-            return
-        missing = [path for path in self._plan_files if not path.is_file()]
-        if missing:
-            messagebox.showerror("文件不存在",
-                                 "\n".join(str(path) for path in missing[:5]))
-            return
-        if not any(step.get("kind") in ("export", "mux") for step in self._plan_steps):
-            self._append_log("提示：计划里没有导出 / 压制步骤，执行完不会生成字幕文件。")
-        self._plan_cancel = threading.Event()
-        self._plan_ok = self._plan_failed = 0
-        self._plan_skipped = 0
-        self._skipped_notes = []
-        self._pending_mux = []
-        self._plan_status = {}
-        self._plan_file_steps = {}
-        self._plan_steps_done = 0
-        self._plan_tokens_total = 0
-        self._plan_current_step_text = ""
-        steps = copy.deepcopy(self._plan_steps)
-        files = list(self._plan_files)
-        # ⚠️ Tk 变量只能在主线程读取：先取成普通值再交给后台线程
-        continue_on_error = bool(self.plan_continue_var.get())
-        asr_language = self.asr_language_var.get()
-        options = {
-            "translate_source": self.translate_source_var.get(),
-            "audio_ordinal": self._selected_audio_ordinal(),
-            "asr_model": self.whisper_model_var.get(),
-            "asr_language": ("" if asr_language == "自动检测"
-                             else WHISPER_LANGUAGE_CODES.get(asr_language, "")),
-            "target": self.target_var.get(),
-            "check_duplicates": bool(self.mux_check_var.get()),
-            "duplicate_threshold": self._mux_threshold(),
-            "check_ai": True,
-            "ai_model": self.translation_model_var.get(),
-            "probe_model": PROBE_WHISPER_MODEL,
-            "probe_seconds": PROBE_SAMPLE_SECONDS,
-        }
-        self._plan_total_steps = max(1, len(files) * len(steps))
-        self._refresh_plan_files_tree()
-        self._set_plan_running(True)
-        self.plan_progress.configure(maximum=self._plan_total_steps, value=0)
-        self.plan_step_progress.configure(maximum=1, value=0)
-        self.plan_progress_var.set(
-            f"总进度 0/{self._plan_total_steps} 步（0/{len(files)} 个文件）")
-        self.plan_token_var.set("Token：本文件 — · 总计 —")
-        self.plan_status_var.set(f"准备处理 {len(files)} 个文件…")
-        self._append_log(f"开始执行计划：{len(files)} 个文件 × {len(steps)} 个步骤")
-        threading.Thread(target=self._plan_worker,
-                         args=(steps, files, continue_on_error, options),
-                         daemon=True).start()
-
-    def _stop_plan(self):
-        if not self.plan_running:
-            return
-        if self._plan_cancel is not None:
-            self._plan_cancel.set()
-        self.plan_stop_button.configure(state="disabled")
-        self.plan_status_var.set("正在停止：当前步骤结束后停止（识别推理无法立即中断）")
-        self._append_log("已请求停止计划。")
-
-    def _set_plan_running(self, running: bool):
-        self.plan_running = running
-        if getattr(self, "plan_button", None) is not None:
-            self.plan_button.configure(state="disabled" if running else "normal")
-        if getattr(self, "plan_stop_button", None) is not None:
-            self.plan_stop_button.configure(state="normal" if running else "disabled")
-        for button in (list(getattr(self, "plan_step_buttons", []))
-                       + list(getattr(self, "plan_file_buttons", []))):
-            button.configure(state="disabled" if running else "normal")
-        self._set_busy(running)
-
-    def _plan_worker(self, steps: list[dict], files: list[Path],
-                     continue_on_error: bool, options: dict):
-        """后台线程：识别线程连续刷文件，主线程拿到结果就翻译 / 压制（流水线）。
-
-        不在这里碰任何 Tk 控件 / 变量：options 是主线程取好的快照。
-        """
-        cancel = self._plan_cancel
-
-        def log(text, name=None):
-            self.events.put(("log", f"[{name}] {text}" if name else str(text)))
-
-        def progress(done, total):
-            self.events.put(("plan_progress", done, total))
-
-        def file_callback(index, total, path_text):
-            self.events.put(("plan_file", index, total, path_text))
-
-        def step_callback(event, index, path):
-            self.events.put(("plan_step", index, str(path), event))
-
-        try:
-            summary = run_plan_for_files(
-                files, steps, log=log, progress=progress, cancel_event=cancel,
-                step_callback=step_callback, file_callback=file_callback,
-                options=options, continue_on_error=continue_on_error,
-                pending_mux=self._pending_mux)
-        except Exception as exc:
-            self.events.put(("log", f"计划异常终止：{exc}"))
-            self.events.put(("plan_done", bool(cancel is not None and cancel.is_set())))
-            return
-        for item in summary.get("skipped") or []:
-            self.events.put(("plan_skip", item["path"], item["reason"], item.get("detail", "")))
-        for item in summary.get("errors") or []:
-            self.events.put(("plan_error", 0, item["path"], item["message"]))
-        for result in summary.get("results") or []:
-            index = next((position for position, path in enumerate(files, 1)
-                          if str(path) == result.get("media")), 0)
-            self.events.put(("plan_result", index, result))
-        self.events.put(("plan_summary", summary))
-        self.events.put(("plan_done", bool(cancel is not None and cancel.is_set())))
-
-    def _on_plan_file(self, index: int, total: int, path_text: str):
-        path = Path(path_text)
-        self._plan_file_steps.setdefault(str(path), [])   # 识别线程可能已经写过明细
-        self._plan_current_step_text = path.name
-        self._plan_set_status(path, "处理中…")
-        self.plan_step_progress.configure(maximum=1, value=0)
-        self.plan_progress_var.set(
-            f"总进度 {self._plan_steps_done}/{self._plan_total_steps} 步"
-            f"（{index - 1}/{total} 个文件）")
-        self.plan_status_var.set(f"正在处理 {index}/{total}：{path.name}")
-        self.status_var.set(f"计划执行中 {index}/{total}：{path.name}")
-        self._update_plan_token_var(path)
-
-    def _on_plan_step(self, index: int, path_text: str, event: dict):
-        """单个步骤开始 / 结束：更新当前步骤进度条、总进度条与文件树里的明细行。"""
-        path = Path(path_text)
-        steps = self._plan_file_steps.setdefault(str(path), [])
-        order = int(event.get("order") or 0)
-        entry = next((item for item in steps if item["order"] == order), None)
-        if entry is None:
-            entry = {"order": order, "label": str(event.get("label") or ""),
-                     "status": "", "tokens": 0}
-            steps.append(entry)
-        label = entry["label"] or str(event.get("kind") or f"步骤 {order}")
-        if event.get("phase") == "begin":
-            entry["status"] = "进行中…"
-            self._plan_current_step_text = (f"{path.name} · 步骤 {order}/"
-                                            f"{event.get('total')}：{label}")
-            self.plan_step_progress.configure(maximum=1, value=0)
-            self.plan_status_var.set(self._plan_current_step_text)
+        current = int(self._play_position * 1000)
+        if direction > 0:
+            row = min(len(entries) - 1, bisect_right(self._subtitle_starts, current + 1))
         else:
-            entry["status"] = "完成"
-            entry["tokens"] = int(event.get("tokens") or 0)
-            self._plan_steps_done += 1
-            self._plan_tokens_total += entry["tokens"]
-            self.plan_progress.configure(
-                value=min(self._plan_steps_done, self._plan_total_steps))
-            self.plan_progress_var.set(
-                f"总进度 {self._plan_steps_done}/{self._plan_total_steps} 步"
-                f"（{self._plan_ok + self._plan_failed}/{len(self._plan_files)} 个文件）")
-            self.plan_step_progress.configure(maximum=1, value=1)
-            self.plan_status_var.set(
-                f"{self._plan_current_step_text}　已完成"
-                + (f" · 本步 token {entry['tokens']:,}" if entry["tokens"] else ""))
-            self._update_plan_token_var(path)
-        self._refresh_plan_files_tree()
+            row = max(0, bisect_right(self._subtitle_starts, current - 1) - 1)
+        self.seek_video(int(10000 * max(0, entries[row]["start_ms"]) /
+                              max(1000 * self._video_duration, 1)))
 
-    def _on_plan_progress(self, done: int, total: int):
-        total = max(1, int(total))
-        done = max(0, min(int(done), total))
-        self.plan_step_progress.configure(maximum=total, value=done)
-        self.plan_status_var.set(
-            f"{self._plan_current_step_text}　{done}/{total} 条"
-            f"（{done * 100 // total}%）")
+    def start_transcription(self):
+        if self.media_path is None or not self.audio_tracks:
+            QMessageBox.information(self, "需要媒体", "请先载入包含音轨的媒体文件。")
+            return
+        media = self.media_path
+        ordinal = max(0, self.audio_box.currentIndex())
+        model = self.asr_model.currentText()
+        language = WHISPER_LANGUAGE_CODES.get(self.asr_language.currentText(), "")
 
-    def _update_plan_token_var(self, path: Path | None = None):
-        file_tokens = sum(int(item.get("tokens") or 0)
-                          for item in self._plan_file_steps.get(str(path), []))
-        self.plan_token_var.set(f"Token：本文件 {file_tokens:,} · "
-                                f"总计 {self._plan_tokens_total:,}")
+        def transcribe(signals):
+            with tempfile.TemporaryDirectory(prefix="media_asr_") as directory:
+                audio = Path(directory) / "audio.wav"
+                audio_to_wav(media, ordinal, audio)
+                return transcribe_audio(audio, model, language,
+                                        progress=signals.log.emit, label="识别")
 
-    def _on_plan_result(self, index: int, result: dict):
-        path = Path(result.get("media") or "")
-        outputs = result.get("outputs") or []
-        tokens = int(result.get("tokens") or 0)
-        self._plan_ok += 1
-        self._plan_set_status(path, f"完成（{len(outputs)} 个输出）")
-        for output in outputs:
-            self._append_log(f"已输出：{output}")
-        if tokens:
-            self._append_log(f"[{path.name}] 本文件 token：{tokens:,}")
-        self._update_plan_token_var(path)
+        self._set_status("正在识别所选音轨…")
+        self._submit(transcribe, self._subtitle_loaded)
 
-    def _on_plan_error(self, index: int, path_text: str, message: str):
-        path = Path(path_text)
-        for item in self._plan_file_steps.get(str(path), []):
-            if item.get("status") == "进行中…":
-                item["status"] = "失败"
-        self._plan_failed += 1
-        self._plan_set_status(path, f"失败：{str(message)[:36]}")
-        self._append_log(f"[{path.name}] 失败：{message}")
-        self._update_plan_token_var(path)
+    def _translation_settings(self):
+        if not (self.original_entries or self.entries):
+            raise StudioError("请先载入字幕，或先识别一个音轨。")
+        return (self.model_box.currentText(), self.source_box.currentText(),
+                self.target_box.currentText(), self.concurrency.value(),
+                self.batch_size.value() if self.grouped.isChecked() else 0,
+                self.context.value())
 
-    def _on_plan_skip(self, path_text: str, reason: str, detail: str = ""):
-        """该文件被自动跳过（重复字幕 / 语言判定 / 没有可用来源）。"""
-        path = Path(path_text)
-        for item in self._plan_file_steps.get(str(path), []):
-            if item.get("status") == "进行中…":
-                item["status"] = "已跳过"
-        self._plan_skipped += 1
-        self._plan_set_status(path, f"跳过 · {reason[:26]}")
-        self._skipped_notes.append(f"{path.name}：{reason}"
-                                   + (f"（{detail}）" if detail else ""))
-        self._update_plan_token_var(path)
+    def _model_changed(self, name):
+        model = translation_model_by_name(name)
+        if model is not None:
+            self.concurrency.setValue(model_concurrency(model))
 
-    def _on_plan_summary(self, summary: dict):
-        """任务列表跑完后，把跳过 / 跳轨的原因统一写进运行日志。"""
-        notes = self._skipped_notes
-        if notes:
-            self._append_log(f"—— 本次有 {len(notes)} 个文件被自动跳过 ——")
-            for line in notes:
-                self._append_log(f"  跳过：{line}")
-            self._append_log("跳过的原因多为字幕重复 / 已经是目标语言 / 判定失败；"
-                             "可关掉「压制前检查重复字幕」或改用「翻译来源」重跑。")
+    def start_translation(self):
+        try:
+            model, source, target, concurrency, batch, context = self._translation_settings()
+        except StudioError as exc:
+            QMessageBox.information(self, "没有字幕", str(exc))
+            return
+        entries = copy.deepcopy(self.original_entries or self.entries)
+        self.translate_cancel = threading.Event()
+        cancel = self.translate_cancel
+        self.cancel_translate_button.setEnabled(True)
+
+        def translate(signals):
+            translated, cancelled = translated_entries(
+                entries, source, target, model, progress=signals.progress.emit,
+                log=signals.log.emit, max_concurrent=concurrency, batch_size=batch,
+                context_lines=context, cancel_event=cancel)
+            return translated, cancelled, subtitles.get_token_stats()[2]
+
+        self._submit(translate, self._translation_finished)
+        self._set_status("正在调用 AI 翻译…")
+
+    def _translation_finished(self, result):
+        translated, cancelled, tokens = result
+        self.translate_cancel = None
+        self.cancel_translate_button.setEnabled(False)
+        if cancelled:
+            self._set_status("翻译已取消")
+            return
+        self.translated = translated
+        self.entries = translated
+        self._populate_subtitles()
+        self._append_log(f"翻译完成：{len(translated)} 条 · tokens {tokens:,}")
+        self._set_status(f"翻译完成：{len(translated)} 条")
+
+    def cancel_translation(self):
+        if self.translate_cancel:
+            self.translate_cancel.set()
+            self.cancel_translate_button.setEnabled(False)
+            self._set_status("正在取消翻译…")
+
+    def start_export(self):
+        if self.media_path is None:
+            return
+        original = copy.deepcopy(self.original_entries or self.entries)
+        translated = copy.deepcopy(self.translated)
+        mode = self.export_language.currentText()
+        if not original or (mode in {"译文", "双语"} and not translated):
+            QMessageBox.information(self, "没有可导出的字幕", "请先载入或生成所需字幕。")
+            return
+        media = self.media_path
+        fmt = self.export_format.currentText().lower()
+        self._submit(lambda _signals: export_subtitles(
+            media, fmt, "外挂字幕", mode, original, translated), self._export_finished)
+        self._set_status("正在导出外挂字幕…")
+
+    def _export_finished(self, outputs):
+        paths = [Path(item) for item in outputs] if isinstance(outputs, (list, tuple)) else [Path(outputs)]
+        self._set_status(f"导出完成：{len(paths)} 个文件")
+        self._append_log("导出完成：" + "、".join(path.name for path in paths))
+        QMessageBox.information(self, "导出完成", "\n".join(map(str, paths)))
+
+    def add_generated_track(self):
+        mode = self.mux_mode.currentText()
+        self._add_mux_track({"kind": "generated", "mode": mode, "title": mode})
+
+    def add_external_tracks(self):
+        start = str(self.media_path.parent) if self.media_path else ""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加要封装的外挂字幕", start,
+            "字幕文件 (*.srt *.ass *.ssa *.vtt *.sub *.smi *.lrc);;所有文件 (*)")
+        known = {item.get("path") for item in self.mux_tracks}
+        for raw in paths:
+            path = Path(raw)
+            if path.is_file() and str(path) not in known:
+                self._add_mux_track({"kind": "external", "path": str(path),
+                                     "title": path.stem, "language": None})
+                known.add(str(path))
+
+    def _add_mux_track(self, spec):
+        self.mux_tracks.append(spec)
+        label = spec.get("title") or spec.get("path") or spec.get("mode")
+        item = QTreeWidgetItem(["生成字幕" if spec["kind"] == "generated" else "外挂字幕",
+                                str(label)])
+        item.setData(0, Qt.ItemDataRole.UserRole, len(self.mux_tracks) - 1)
+        self.mux_tracks_tree.addTopLevelItem(item)
+        self._update_export_hint()
+
+    def remove_mux_track(self):
+        selected = self.mux_tracks_tree.currentItem()
+        if selected is None:
+            return
+        index = int(selected.data(0, Qt.ItemDataRole.UserRole))
+        self.mux_tracks.pop(index)
+        self.mux_tracks_tree.clear()
+        for spec in self.mux_tracks:
+            self._add_mux_track(spec)
+        self._update_export_hint()
+
+    def _mux_specs(self):
+        specs = [dict(item) for item in self.mux_tracks]
+        for item in specs:
+            if item.get("kind") == "external" and self.media_path:
+                item["bind"] = subtitle_binding(self.media_path, Path(item["path"]))
+        return normalize_export_tracks(specs)
+
+    def start_mux(self):
+        if self.media_path is None:
+            return
+        original = copy.deepcopy(self.original_entries or self.entries)
+        translated = copy.deepcopy(self.translated)
+        try:
+            specs = self._mux_specs()
+        except StudioError as exc:
+            QMessageBox.warning(self, "字幕轨无效", str(exc))
+            return
+        if not specs:
+            QMessageBox.information(self, "没有字幕轨", "请添加生成字幕或外挂字幕轨。")
+            return
+        if any(item["kind"] == "generated" for item in specs) and not original:
+            QMessageBox.information(self, "没有字幕", "生成字幕前请先载入或识别字幕。")
+            return
+        if any(item["kind"] == "generated" and item.get("mode") != "原文" for item in specs) and not translated:
+            QMessageBox.information(self, "没有译文", "请先翻译字幕或只封装原文。")
+            return
+        dropped = []
+        if not self.keep_existing.isChecked():
+            for index in range(self.embedded_tree.topLevelItemCount()):
+                item = self.embedded_tree.topLevelItem(index)
+                if item.checkState(0) != Qt.CheckState.Checked:
+                    dropped.append(int(item.data(0, Qt.ItemDataRole.UserRole)))
+        media = self.media_path
+        fmt = self.mux_format.currentText().lower()
+        output_language = self.export_language.currentText()
+        settings = {"check_duplicates": self.check_duplicates.isChecked(),
+                    "duplicate_threshold": self.duplicate_threshold.value(),
+                    "check_ai": True, "ai_model": self.model_box.currentText()}
+
+        def mux(signals):
+            candidates = []
+            tracks, missing = resolve_export_tracks(
+                media, specs, log=signals.log.emit)
+            if not tracks:
+                raise StudioError("找不到可封装的字幕轨：" + "; ".join(i["reason"] for i in missing))
+            for position, track in enumerate(tracks, 1):
+                label = (f"外部字幕 {Path(str(track['path'])).name}" if track.get("kind") == "external"
+                         else f"生成字幕 {track.get('mode', '原文')}")
+                candidates.append({"key": position, "label": label, "spec": track,
+                                   "entries": _plan_track_contents(track, original, translated)})
+            dropped_tracks = []
+            if settings["check_duplicates"]:
+                checked = check_mux_tracks(
+                    media, candidates, threshold=settings["duplicate_threshold"],
+                    use_ai=settings["check_ai"], model_name=settings["ai_model"],
+                    log=signals.log.emit)
+                candidates, dropped_tracks = checked["keep"], checked["dropped"]
+            if not candidates:
+                raise StudioError("所有待封装字幕都重复或为空，未生成输出文件。")
+            return export_subtitles(
+                media, fmt, "内嵌字幕", output_language, original, translated,
+                drop_subtitles=dropped, mux_tracks=[item["spec"] for item in candidates])
+
+        self._submit(mux, self._export_finished)
+        self._set_status("正在检查并封装字幕轨…")
+
+    def add_asr_step(self):
+        language = self.asr_language.currentText()
+        self._add_step("asr", "识别", {"model": self.asr_model.currentText(),
+            "whisper_language": WHISPER_LANGUAGE_CODES.get(language, ""),
+            "audio_ordinal": max(0, self.audio_box.currentIndex())})
+
+    def add_translate_step(self):
+        try:
+            model, source, target, concurrency, batch, context = self._translation_settings()
+        except StudioError as exc:
+            QMessageBox.warning(self, "参数无效", str(exc))
+            return
+        self._add_step("translate", "翻译", {"model_name": model, "source": source,
+            "target": target, "concurrency": concurrency, "batch_size": batch,
+            "context_lines": context, "translate_source": self.translate_source.currentText()})
+
+    def add_export_step(self):
+        if self.export_tabs.currentIndex() == 0:
+            self._add_step("export", "导出字幕", {"mode": "file",
+                "format": self.export_format.currentText().lower(),
+                "language": self.export_language.currentText()})
+        else:
+            self.add_mux_step()
+
+    def add_mux_step(self):
+        try:
+            tracks = self._mux_specs()
+        except StudioError as exc:
+            QMessageBox.warning(self, "字幕轨无效", str(exc))
+            return
+        drop = []
+        if not self.keep_existing.isChecked():
+            for i in range(self.embedded_tree.topLevelItemCount()):
+                item = self.embedded_tree.topLevelItem(i)
+                if item.checkState(0) != Qt.CheckState.Checked:
+                    drop.append(int(item.data(0, Qt.ItemDataRole.UserRole)))
+        self._add_step("mux", "字幕封装", {"format": self.mux_format.currentText().lower(),
+            "language": self.export_language.currentText(), "mux_tracks": tracks,
+            "drop_subtitles": drop, "check_duplicates": self.check_duplicates.isChecked(),
+            "duplicate_threshold": self.duplicate_threshold.value()})
+
+    def _add_step(self, kind, label, settings):
+        self.plan_steps.append({"kind": kind, "page": label, "label": label,
+                                "detail": str(settings), "settings": settings})
+        self._refresh_plan()
+
+    def _refresh_plan(self):
+        self.steps_tree.clear()
+        for index, step in enumerate(self.plan_steps, 1):
+            QTreeWidgetItem(self.steps_tree, [str(index), step["page"], step["detail"]])
+        self.files_tree.clear()
+        for path in self.plan_files:
+            QTreeWidgetItem(self.files_tree, [path.name, "待处理"])
+
+    def move_step(self, offset):
+        index = self.steps_tree.currentIndex().row()
+        target = index + offset
+        if 0 <= index < len(self.plan_steps) and 0 <= target < len(self.plan_steps):
+            self.plan_steps[index], self.plan_steps[target] = self.plan_steps[target], self.plan_steps[index]
+            self._refresh_plan()
+            self.steps_tree.setCurrentItem(self.steps_tree.topLevelItem(target))
+
+    def remove_step(self):
+        index = self.steps_tree.currentIndex().row()
+        if 0 <= index < len(self.plan_steps):
+            self.plan_steps.pop(index)
+            self._refresh_plan()
+
+    def clear_steps(self):
+        self.plan_steps.clear()
+        self._refresh_plan()
+
+    def choose_plan_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择媒体文件", "", "媒体文件 (" + " ".join(f"*{ext}" for ext in sorted(MEDIA_EXTENSIONS)) + ")")
+        self._add_plan_files(paths)
+
+    def _add_plan_files(self, paths):
+        for raw in paths:
+            path = Path(raw)
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS and path not in self.plan_files:
+                self.plan_files.append(path)
+        self._refresh_plan()
+
+    def add_current_file(self):
+        if self.media_path:
+            self._add_plan_files([self.media_path])
+
+    def remove_plan_file(self):
+        index = self.files_tree.currentIndex().row()
+        if 0 <= index < len(self.plan_files):
+            self.plan_files.pop(index)
+            self._refresh_plan()
+
+    def clear_plan_files(self):
+        self.plan_files.clear()
+        self._refresh_plan()
+
+    def start_plan(self):
+        if self._busy or self.plan_cancel is not None:
+            return
+        if not self.plan_steps or not self.plan_files:
+            QMessageBox.information(self, "计划不完整", "请添加至少一个步骤和一个媒体文件。")
+            return
+        steps, files = copy.deepcopy(self.plan_steps), list(self.plan_files)
+        self.plan_cancel = threading.Event()
+        cancel = self.plan_cancel
+        continue_on_error = self.plan_continue.isChecked()
+        self.run_plan_button.setEnabled(False)
+        self.stop_plan_button.setEnabled(True)
+        self.progress.setRange(0, max(1, len(files) * len(steps)))
+        options = {"audio_ordinal": max(0, self.audio_box.currentIndex()),
+                   "asr_model": self.asr_model.currentText(),
+                   "asr_language": WHISPER_LANGUAGE_CODES.get(
+                       self.asr_language.currentText(), ""),
+                   "translate_source": self.translate_source.currentText(),
+                   "target": self.target_box.currentText(),
+                   "check_duplicates": self.check_duplicates.isChecked(),
+                   "duplicate_threshold": self.duplicate_threshold.value(),
+                   "check_ai": True, "ai_model": self.model_box.currentText(),
+                   "probe_model": PROBE_WHISPER_MODEL,
+                   "probe_seconds": PROBE_SAMPLE_SECONDS}
+        self._set_busy(True)
+
+        def run(signals):
+            pending_mux = []
+            summary = run_plan_for_files(
+                files, steps,
+                log=lambda text, name=None: signals.log.emit(
+                    f"[{name}] {text}" if name else str(text)),
+                progress=signals.progress.emit, cancel_event=cancel, options=options,
+                continue_on_error=continue_on_error, pending_mux=pending_mux)
+            return summary, pending_mux
+
+        self._submit(run, self._plan_finished, busy=False)
+        self._set_status(f"执行计划：{len(files)} 个文件 × {len(steps)} 步")
+
+    def _plan_finished(self, summary):
+        summary, self._pending_mux = summary
+        self.plan_cancel = None
+        self.run_plan_button.setEnabled(True)
+        self.stop_plan_button.setEnabled(False)
+        self._set_busy(False)
+        results = summary.get("results") or []
         errors = summary.get("errors") or []
-        if errors:
-            self._append_log(f"—— {len(errors)} 个文件失败 ——")
-            for item in errors:
-                self._append_log(f"  {Path(item['path']).name}：{item['message']}")
-
-    def _on_plan_done(self, cancelled: bool):
-        self._set_plan_running(False)
-        self._plan_cancel = None
-        if cancelled:
-            for steps in self._plan_file_steps.values():
-                for item in steps:
-                    if item.get("status") == "进行中…":
-                        item["status"] = "已停止"
-            self._refresh_plan_files_tree()
-        summary = (f"计划结束：成功 {self._plan_ok} · 失败 {self._plan_failed} · "
-                   f"跳过 {self._plan_skipped} · "
-                   f"共 {len(self._plan_files)} 个文件 · 完成 {self._plan_steps_done}/"
-                   f"{self._plan_total_steps} 步 · token {self._plan_tokens_total:,}")
-        if cancelled:
-            summary += "（已停止）"
-        self.plan_status_var.set(summary)
-        skipped = max(0, self._plan_total_steps - self._plan_steps_done)
-        self.plan_progress_var.set(
-            f"总进度 {self._plan_steps_done}/{self._plan_total_steps} 步"
-            f"（{self._plan_ok}/{len(self._plan_files)} 个文件成功"
-            + (f"，{skipped} 步未执行" if skipped else "") + "）")
-        self.status_var.set(summary)
-        self._append_log(summary)
+        skipped = summary.get("skipped") or []
+        statuses = {str(item.get("media")): "完成" for item in results}
+        statuses.update({str(item.get("path")): f"失败：{item.get('message', '')[:60]}"
+                         for item in errors})
+        statuses.update({str(item.get("path")): f"跳过：{item.get('reason', '')[:60]}"
+                         for item in skipped})
+        for index, path in enumerate(self.plan_files):
+            item = self.files_tree.topLevelItem(index)
+            if item is not None:
+                item.setText(1, statuses.get(str(path), "已停止"))
+        self._set_status(f"计划结束：成功 {len(results)} · 失败 {len(errors)} · 跳过 {len(skipped)}")
+        for item in errors:
+            self._append_log(f"失败：{Path(item['path']).name} · {item['message']}")
+        for item in skipped:
+            self._append_log(f"跳过：{Path(item['path']).name} · {item['reason']}")
         if self._pending_mux:
-            missing_count = sum(len(item.get("missing") or [])
-                                for item in self._pending_mux)
-            self._append_log(f"—— {missing_count} 处外部字幕没找到对应字幕，"
-                             "稍后弹出窗口由你决定放弃还是补选 ——")
-            self.root.after(150, self._open_pending_mux_dialog)
+            QTimer.singleShot(0, self._open_pending_mux_dialog)
 
-    # ------------------------------------------------- 缺字幕：结束后补选 / 放弃
     def _open_pending_mux_dialog(self):
-        """整批任务结束后：列出「没找到对应字幕」的文件，让用户放弃或补选字幕再压制。"""
-        records = [item for item in self._pending_mux if item.get("missing")]
+        records = [record for record in self._pending_mux if record.get("missing")]
         self._pending_mux = []
         if not records:
             return
-        missing_count = sum(len(item["missing"]) for item in records)
-        window = tk.Toplevel(self.root)
-        window.title("有文件没找到对应的字幕")
-        window.configure(background=PALETTE["bg"])
-        window.transient(self.root)
-        pad = self.px(12)
-        ttk.Label(
-            window, justify="left", wraplength=self.px(570),
-            text=(f"{len(records)} 个文件共有 {missing_count} 处外部字幕没在旁边找到对应字幕。\n"
-                  "· 放弃：这些字幕不再压制（其它字幕轨 / 其它文件不受影响）；\n"
-                  "· 补选：选中行后指定要压进该文件的字幕，再点「开始压制」重做这些文件"
-                  "（识别 / 翻译结果沿用，不会重新识别）。")
-        ).pack(anchor="w", padx=pad, pady=(pad, self.px(6)))
-
-        wrap = ttk.Frame(window)
-        wrap.pack(fill="both", expand=True, padx=pad)
-        tree = ttk.Treeview(wrap, columns=("file", "missing", "state", "chosen"),
-                            show="headings", selectmode="extended",
-                            height=min(14, max(4, missing_count)))
-        for column, title, width in (("file", "文件", 200), ("missing", "没找到的字幕", 250),
-                                     ("state", "当前状态", 90), ("chosen", "补选的字幕", 200)):
-            tree.heading(column, text=title)
-            tree.column(column, width=self.px(width), anchor="w")
-        scroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scroll.set)
-        tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        rows: list[dict] = []
+        dialog = QDialog(self)
+        dialog.setWindowTitle("有文件缺少对应字幕")
+        dialog.resize(850, 460)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "为选中项补选字幕后，只重新封装这些文件；未选择的字幕轨会放弃。"))
+        listing = QListWidget()
+        layout.addWidget(listing, 1)
+        rows = []
         for record in records:
             media_name = Path(str(record.get("media") or "")).name
-            state = "未压制" if record.get("skipped") else "已压其余轨"
-            for item in record.get("missing") or []:
-                position = len(rows)
-                rows.append({"record": record, "index": int(item.get("index", -1)),
-                             "label": str(item.get("label") or "外部字幕"),
-                             "reason": str(item.get("reason") or ""),
-                             "chosen": None})
-                tree.insert("", "end", iid=str(position),
-                            values=(media_name, rows[position]["label"], state, "—"))
+            for missing in record.get("missing") or []:
+                row = {"record": record, "index": int(missing.get("index", -1)),
+                       "label": str(missing.get("label") or "外部字幕"), "chosen": None}
+                rows.append(row)
+                item = QListWidgetItem(f"{media_name}  |  {row['label']}  |  未选择")
+                item.setData(Qt.ItemDataRole.UserRole, len(rows) - 1)
+                listing.addItem(item)
+        choose_button = QPushButton("为选中项选择字幕…")
+        layout.addWidget(choose_button)
 
-        buttons = ttk.Frame(window)
-        buttons.pack(fill="x", padx=pad, pady=(self.px(6), pad))
-        ttk.Button(buttons, text="放弃（不压制这些字幕）",
-                   command=window.destroy).pack(side="left")
-        ttk.Button(buttons, text="开始压制", style="Accent.TButton",
-                   command=lambda: self._confirm_pending_mux(rows, window)
-                   ).pack(side="right")
-        ttk.Button(buttons, text="为选中项选择字幕…",
-                   command=lambda: self._choose_pending_subtitle(tree, rows)
-                   ).pack(side="right", padx=(0, self.px(6)))
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
-        window.grab_set()
-        window.focus_set()
-        self._append_log(f"已弹出窗口：{missing_count} 处外部字幕可选「放弃」"
-                         "或「补选字幕后重新压制」。")
+        def choose_subtitle():
+            selected = listing.selectedItems()
+            if not selected:
+                return
+            start = str(Path(str(rows[int(selected[0].data(Qt.ItemDataRole.UserRole))]
+                                      ["record"].get("media") or "")).parent)
+            path, _ = QFileDialog.getOpenFileName(
+                dialog, "选择要封装的字幕", start,
+                "字幕文件 (*.srt *.ass *.ssa *.vtt *.sub *.smi *.lrc);;所有文件 (*)")
+            if not path:
+                return
+            for item in selected:
+                index = int(item.data(Qt.ItemDataRole.UserRole))
+                rows[index]["chosen"] = Path(path)
+                item.setText(f"{Path(rows[index]['record']['media']).name}  |  "
+                             f"{rows[index]['label']}  |  {Path(path).name}")
 
-    def _choose_pending_subtitle(self, tree, rows):
-        """给选中的行指定要压进对应文件的字幕文件（多选时共用同一个文件）。"""
-        selection = sorted(int(item) for item in tree.selection())
-        if not selection:
-            messagebox.showinfo("请选择", "先在列表里选中要补选字幕的行（可多选）。",
-                                parent=tree.winfo_toplevel())
+        choose_button.clicked.connect(choose_subtitle)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始封装")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("放弃")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._append_log("缺少对应字幕的轨道已放弃。")
             return
-        options = {"title": "选择要压进这些文件的字幕",
-                   "parent": tree.winfo_toplevel(),
-                   "filetypes": [("字幕文件", "*.srt *.ass *.ssa *.vtt *.sub *.smi *.lrc"),
-                                 ("所有文件", "*.*")]}
-        folder = Path(str(rows[selection[0]]["record"].get("media") or "")).parent
-        if folder.is_dir():
-            options["initialdir"] = str(folder)
-        chosen = filedialog.askopenfilename(**options)
-        if not chosen:
-            return
-        path = Path(chosen)
-        for position in selection:
-            rows[position]["chosen"] = path
-            tree.set(str(position), "chosen", path.name)
-        tree.see(str(selection[-1]))
-
-    def _confirm_pending_mux(self, rows, window):
-        """按用户的选择收尾：没选字幕的行 = 放弃。"""
         jobs = [row for row in rows if row["chosen"] is not None]
-        window.destroy()
-        if not jobs:
-            self._append_log("缺字幕的字幕轨已全部放弃，不压制这些字幕。")
-            self.status_var.set("已放弃没有对应字幕的字幕轨")
-            return
-        self._run_pending_mux(jobs)
+        if jobs:
+            self._run_pending_mux(jobs)
 
-    def _run_pending_mux(self, jobs: list[dict]):
-        """把补选的字幕压进对应文件：每个文件单独重跑压制步骤（识别 / 翻译结果沿用）。"""
-        tasks: list[dict] = []
+    def _run_pending_mux(self, jobs):
+        grouped = {}
         for row in jobs:
             record = row["record"]
-            tracks = [dict(item) for item in (record.get("tracks") or [])]
-            index = int(row["index"])
+            index = row["index"]
+            key = id(record)
+            task = grouped.setdefault(key, {
+                "record": record,
+                "tracks": [dict(track) for track in record.get("tracks") or []],
+            })
+            tracks = task["tracks"]
             if not 0 <= index < len(tracks):
                 continue
             spec = dict(tracks[index])
-            spec.pop("bind", None)          # 用户手选的字幕 → 直接按这个文件用
-            spec["kind"] = "external"
-            spec["mode"] = ""
-            spec["path"] = str(row["chosen"])
-            spec["title"] = spec.get("title") or row["chosen"].stem
+            spec.pop("bind", None)
+            spec.update(kind="external", mode="", path=str(row["chosen"]),
+                        title=spec.get("title") or row["chosen"].stem)
             tracks[index] = spec
-            tasks.append({
-                "record": record,
-                "step": {"kind": "mux", "page": "压制", "label": "压制（补选字幕）",
-                         "detail": row["chosen"].name,
-                         "settings": {"format": record.get("format") or "srt",
-                                      "language": record.get("language") or "原文",
-                                      "drop_subtitles": record.get("drop_subtitles") or [],
-                                      "mux_tracks": tracks}},
-            })
-        if not tasks:
-            self.status_var.set("没有可重新压制的文件")
+        if not grouped:
             return
-        self._set_busy(True)
-        self.status_var.set(f"正在用补选的字幕压制 {len(tasks)} 个文件…")
-        self._append_log(f"开始用补选的字幕压制 {len(tasks)} 个文件…")
-        threading.Thread(target=self._pending_mux_worker, args=(tasks,),
-                         daemon=True).start()
+        tasks = list(grouped.values())
 
-    def _pending_mux_worker(self, tasks: list[dict]):
-        """后台线程：逐个文件用补选的字幕重新压制；不碰任何 Tk 控件。"""
-        outputs: list[str] = []
-        skipped: list[str] = []
-        errors: list[str] = []
-        for task in tasks:
-            record = task["record"]
-            path = Path(str(record.get("media") or ""))
-            name = path.name
-
-            def log(text, name=name):
-                self.events.put(("log", f"[{name}] {text}"))
-
-            try:
+        def mux_missing(signals):
+            outputs = []
+            for task in tasks:
+                record = task["record"]
+                step = {"kind": "mux", "page": "字幕封装", "label": "补选字幕封装",
+                        "settings": {"format": record.get("format") or "srt",
+                                     "language": record.get("language") or "原文",
+                                     "drop_subtitles": record.get("drop_subtitles") or [],
+                                     "mux_tracks": task["tracks"]}}
                 outcome = run_plan_for_media(
-                    path, [task["step"]], log=log,
-                    prepared=record.get("prepared"),
-                    options=record.get("options") or {})
-            except PlanSkipped as exc:
-                skipped.append(f"{name}：{exc.reason}")
-                continue
-            except Exception as exc:
-                errors.append(f"{name}：{exc}")
-                continue
-            for output in outcome.get("outputs") or []:
-                outputs.append(str(output))
-        lines: list[str] = []
-        if outputs:
-            lines.append(f"已生成 {len(outputs)} 个文件："
-                         + "、".join(Path(item).name for item in outputs[:6])
-                         + ("…" if len(outputs) > 6 else ""))
-        if skipped:
-            lines.append("跳过：" + "；".join(skipped))
-        if errors:
-            lines.append("失败：" + "；".join(errors))
-        self.events.put(("pending_done", "\n".join(lines) or "没有生成任何文件。", outputs))
+                    record["media"], [step],
+                    log=lambda text: signals.log.emit(
+                        f"[{Path(record['media']).name}] {text}"),
+                    prepared=record.get("prepared"), options=record.get("options") or {})
+                outputs.extend(outcome.get("outputs") or [])
+            return outputs
 
-    def _on_pending_mux_done(self, message: str, outputs: list[str]):
-        self._set_busy(False)
-        for output in outputs:
-            self._append_log(f"补选压制输出：{output}")
-        self._append_log("补选字幕压制：" + str(message).replace("\n", " · "))
-        self.status_var.set("补选字幕压制完成" if outputs else "补选字幕压制结束（没有输出）")
-        messagebox.showinfo("补选字幕压制", message)
+        self._submit(mux_missing, self._pending_mux_finished)
+        self._set_status(f"正在补选封装 {len(tasks)} 个文件…")
 
-    def _run_worker(self, status: str, function, *args):
-        if self.busy:
+    def _pending_mux_finished(self, outputs):
+        self._set_status(f"补选封装完成：{len(outputs)} 个文件")
+        self._append_log("补选封装输出：" + "、".join(Path(path).name for path in outputs))
+        QMessageBox.information(self, "补选封装完成",
+                                "\n".join(map(str, outputs)) if outputs else "没有生成输出文件。")
+
+    def stop_plan(self):
+        if self.plan_cancel:
+            self.plan_cancel.set()
+            self.stop_plan_button.setEnabled(False)
+            self._set_status("正在停止计划…")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        media = next((path for path in paths if path.suffix.lower() in MEDIA_EXTENSIONS), None)
+        subtitle = next((path for path in paths if path.suffix.lower() in SUBTITLE_EXTENSIONS), None)
+        if media:
+            self.load_media(media)
+            if subtitle:
+                QTimer.singleShot(500, lambda: self._adopt_subtitle(subtitle))
+        elif subtitle:
+            self._adopt_subtitle(subtitle)
+
+    def _open_video(self, has_video):
+        if not has_video or self.media_path is None:
+            self.preview.setText("音频文件：没有视频画面")
             return
-        self._set_busy(True)
-        self.status_var.set(status)
+        if cv2 is None:
+            self.preview.setText(opencv_missing_message())
+            return
+        self._video = cv2.VideoCapture(str(self.media_path))
+        if not self._video.isOpened():
+            self._video.release()
+            self._video = None
+            self.preview.setText("无法打开视频流进行预览")
+            return
+        self._video_fps = float(self._video.get(CAP_PROP_FPS) or 25.0)
+        frames = float(self._video.get(CAP_PROP_FRAME_COUNT) or 0)
+        self._video_duration = frames / self._video_fps if self._video_fps > 0 else 0
+        self.seek.setEnabled(True)
+        self.play_button.setEnabled(True)
+        self.prev_button.setEnabled(True)
+        self.next_button.setEnabled(True)
+        # 视频载入成功后：左侧预览区自动占满（右侧收窄到最小宽度，仍可手动拖回）
+        self.split.widget(1).setMinimumWidth(340)
+        total = max(1, self.split.size().width())
+        self.split.setSizes([total - 340, 340])
+        self._render_frame()
 
-        def worker():
-            try:
-                result = function(*args)
-                self.events.put(("result", function.__name__, result))
-            except Exception as exc:
-                self.events.put(("error", str(exc), traceback.format_exc()))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _set_busy(self, busy: bool):
-        self.busy = busy
-        state = "disabled" if busy else "normal"
-        for button in (getattr(self, "choose_button", None),
-                       getattr(self, "load_subtitle_button", None),
-                       getattr(self, "asr_button", None),
-                       getattr(self, "plan_asr_button", None),
-                       getattr(self, "translate_button", None),
-                       getattr(self, "plan_translate_button", None),
-                       getattr(self, "export_button", None),
-                       getattr(self, "mux_button", None),
-                       getattr(self, "plan_export_button", None),
-                       getattr(self, "plan_mux_button", None)):
-            if button is not None:
-                button.configure(state=state)
-        if busy:
-            self.footer_progress.start(12)
+    def _render_frame(self):
+        if self._video is None:
+            return
+        if self._seek_pending:
+            self._video.set(CAP_PROP_POS_MSEC, self._play_position * 1000)
+            self._seek_pending = False
+        ok, frame = self._video.read()
+        if not ok:
+            return
+        target = self.preview.size()
+        target_width, target_height = max(1, target.width()), max(1, target.height())
+        height, width = frame.shape[:2]
+        scale = min(target_width / width, target_height / height)
+        if scale < 1:
+            resized = cv2.resize(
+                frame, (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA)
         else:
-            self.footer_progress.stop()
-        self._update_translate_hint()
+            resized = frame
+        height, width = resized.shape[:2]
+        image = QImage(resized.data, width, height, resized.strides[0],
+                       QImage.Format.Format_BGR888).copy()
+        pixmap = QPixmap.fromImage(image)
+        milliseconds = int(self._play_position * 1000)
+        row, mode, blocks = self._caption_blocks_for(milliseconds)
+        if row >= 0 and blocks:
+            cache_key = (row, mode, width, height)
+            overlay = self._caption_cache.get(cache_key)
+            if overlay is None:
+                overlay = QPixmap(width, height)
+                overlay.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(overlay)
+                painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                bottom = height - 12
+                for block in blocks:
+                    bottom = self._draw_caption(painter, overlay, block, bottom)
+                painter.end()
+                if len(self._caption_cache) >= 32:
+                    self._caption_cache.pop(next(iter(self._caption_cache)))
+                self._caption_cache[cache_key] = overlay
+            painter = QPainter(pixmap)
+            painter.drawPixmap(0, 0, overlay)
+            painter.end()
+        self.preview.setPixmap(pixmap)
+        if self._video_duration > 0:
+            self.seek.blockSignals(True)
+            self.seek.setValue(int(self._play_position / self._video_duration * 10000))
+            self.seek.blockSignals(False)
+            self.time_label.setText(f"{self._clock(self._play_position)} / {self._clock(self._video_duration)}")
 
-    def _handle_result(self, name: str, result):
-        if name == "_load_media_worker":
-            self._choose_audio(result)
-        elif name == "_load_subtitle_worker":
-            self._subtitle_loaded(result)
-        elif name == "_transcribe_worker":
-            entries = result["entries"]
-            self.entries = entries
-            self.original_entries = copy.deepcopy(entries)
-            self.translated = []
-            self.subtitle_source = {"kind": "generated"}
-            self._populate_tree()
-            self.refresh_preview()
-            self.asr_status_var.set(f"识别完成：{len(entries)} 条 · {result['model']}")
-            self._append_log(f"识别完成：{len(entries)} 条 · 模型 {result['model']}")
-            self.status_var.set(f"识别完成：{len(entries)} 条，可继续翻译")
-        elif name == "_translate_worker":
-            if result.get("cancelled"):
-                self._set_translate_running(False)
-                self._append_log("翻译已取消（未写入半成品）。")
-                self.status_var.set("翻译已取消")
-                message = "已取消：字幕保持原文，可重新开始"
-            else:
-                self.translated = result["translated"]
-                self.entries = result["translated"]
-                self._populate_tree()
-                self.refresh_preview()
-                self._set_translate_running(False)
-                total = max(1, result["total"])
-                self.translate_progress.configure(maximum=total, value=total)
-                self._append_log(f"翻译完成：{result['total']} 条 · tokens {result['tokens']:,}")
-                self.status_var.set(f"翻译完成：{result['total']} 条")
-                message = (f"完成：{result['total']} 条 · 本轮消耗 "
-                           f"{result['tokens']:,} tokens")
-            self._update_entry_stats()
-            self.translate_progress_var.set(message)
-        elif name == "_export_worker":
-            paths = [Path(item) for item in
-                     (result if isinstance(result, (list, tuple)) else [result])]
-            if paths:
-                messagebox.showinfo("导出完成", f"已生成 {len(paths)} 个文件：\n"
-                                    + "\n".join(str(path) for path in paths))
-                for path in paths:
-                    self._append_log(f"导出完成：{path}")
-                self.status_var.set(f"已导出 {len(paths)} 个文件" if len(paths) > 1
-                                    else f"已导出：{paths[0].name}")
-            else:
-                self.status_var.set("导出结束：没有生成文件")
-        elif name == "_mux_worker":
-            paths = [Path(item) for item in (result.get("outputs") or [])]
-            dropped = result.get("dropped") or []
-            tokens = int(result.get("tokens") or 0)
-            for path in paths:
-                self._append_log(f"压制完成：{path}")
-            for item in dropped:
-                self._append_log(f"跳过字幕轨：{item['label']}（与 {item['target']} 同语言且内容雷同 "
-                                 f"{item['ratio']:.0%}）")
-            if tokens:
-                self._append_log(f"重复检查 token：{tokens:,}")
-            if paths:
-                extra = f"（另有 {len(dropped)} 条重复字幕轨未压入）" if dropped else ""
-                messagebox.showinfo("压制完成", f"已生成：\n{paths[0]}{extra}")
-                self.status_var.set(f"已压制：{paths[0].name}")
-            else:
-                self.status_var.set("压制结束：没有生成文件")
+    def _caption_blocks_for(self, milliseconds):
+        entries = self.original_entries or self.entries
+        row = bisect_right(self._subtitle_starts, milliseconds) - 1
+        if not 0 <= row < len(entries) or milliseconds >= int(entries[row].get("end_ms") or 0):
+            return -1, "", []
+        if self.export_tabs.currentIndex() == 1:
+            mode = self.mux_mode.currentText()
+        else:
+            mode = self.export_language.currentText()
+        if mode == "不添加生成字幕":
+            return row, mode, []
+        blocks = []
+        if mode in ("译文", "双语") and row < len(self.translated):
+            text = str(self.translated[row].get("text") or "")
+            if text:
+                blocks.append(default_preview_block(text))
+        if mode in ("原文", "双语"):
+            entry = entries[row]
+            blocks.append(entry.get("_preview") or default_preview_block(entry.get("text", "")))
+        return row, mode, blocks
 
-    def _poll_events(self):
-        if self._closing:
+    @staticmethod
+    def _qt_colour(rgb):
+        red, green, blue = tuple(rgb or (255, 255, 255))[:3]
+        return f"#{int(red):02x}{int(green):02x}{int(blue):02x}"
+
+    def _draw_caption(self, painter, image, block, bottom):
+        height, width = image.height(), image.width()
+        res_x, res_y = int(block.get("res_x") or 0), int(block.get("res_y") or 0)
+        scale_y = height / res_y if res_y else 1.0
+        font_size = float(block.get("size") or 0)
+        font_px = max(12, round(font_size * scale_y) if font_size else round(height * 0.045))
+        family = html.escape(str(block.get("family") or "Microsoft YaHei UI"), quote=True)
+        scale_x = width / res_x if res_x else 1.0
+        margin_left = float(block.get("margin_l") or 0) * scale_x
+        margin_right = float(block.get("margin_r") or 0) * scale_x
+        if not res_x:
+            margin_left = margin_right = 20
+        available = max(40, width - margin_left - margin_right)
+        alignment = int(block.get("alignment") or 2)
+        column, row = (alignment - 1) % 3, (alignment - 1) // 3
+        align = ("left", "center", "right")[column]
+        color = self._qt_colour(block.get("primary"))
+        lines = []
+        for line in block.get("lines") or []:
+            runs = []
+            for run in line:
+                text = html.escape(str(run.get("text") or "")).replace("\n", "<br>")
+                if not text:
+                    continue
+                styles = []
+                if run.get("colour"):
+                    styles.append(f"color:{self._qt_colour(run['colour'])}")
+                if run.get("bold") or block.get("bold"):
+                    styles.append("font-weight:bold")
+                if run.get("italic") or block.get("italic"):
+                    styles.append("font-style:italic")
+                if run.get("underline"):
+                    styles.append("text-decoration:underline")
+                runs.append(f'<span style="{";".join(styles)}">{text}</span>' if styles else text)
+            lines.append("".join(runs) or "&nbsp;")
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(QFont(family, font_px))
+        outline = self._qt_colour(block.get("outline") or (16, 16, 16))
+        outline_px = max(0, float(block.get("border") or 0) * scale_y)
+        document.setHtml(
+            f'<div style="color:{color};font-family:{family};font-size:{font_px}px;'
+            f'-qt-text-outline:{outline_px:.1f}px {outline};text-align:{align};">'
+            f'{"<br>".join(lines)}</div>')
+        document.setTextWidth(available)
+        document_height = document.size().height()
+        margin_v = float(block.get("margin_v") or 0) * scale_y
+        if row == 0:
+            y = bottom - document_height - (margin_v or 18)
+        elif row == 1:
+            y = (height - document_height) / 2
+        else:
+            y = margin_v
+        painter.save()
+        painter.translate(margin_left, y)
+        if block.get("background", True):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 145))
+            painter.drawRoundedRect(-8, -4, available + 16, document_height + 8, 4, 4)
+        document.drawContents(painter)
+        painter.restore()
+        return y - 8
+
+    def _video_tick(self):
+        if self._audio_clock is not None:
+            position = self._audio_clock.position_ms()
+            if position is not None:
+                target = position / 1000 - self.sync_spin.value()
+            else:
+                started = getattr(self._audio_clock, "started_at", None)
+                if started is not None and time.monotonic() - started < 2.0:
+                    return
+                self._stop_audio()
+                target = self._play_started + time.perf_counter() - self._play_anchor
+        else:
+            target = self._play_started + time.perf_counter() - self._play_anchor
+        self._play_position = max(0.0, target)
+        if self._video_duration and target >= self._video_duration:
+            self.pause_playback()
             return
-        while True:
+        current = float(self._video.get(CAP_PROP_POS_MSEC) or 0) / 1000
+        if abs(current - target) > 1.8 / max(self._video_fps, 1.0):
+            self._seek_pending = True
+            self._video.set(CAP_PROP_POS_MSEC, target * 1000)
+        self._render_frame()
+
+    @staticmethod
+    def _clock(seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+    def toggle_playback(self):
+        if self._video is None:
+            return
+        if self._frame_timer.isActive():
+            self.pause_playback()
+            return
+        self._play_anchor = time.perf_counter()
+        self._play_started = self._play_position
+        self._start_audio(self._play_position)
+        self.play_button.setText("暂停")
+        self._frame_timer.start()
+
+    def _start_audio(self, seconds):
+        self._stop_audio()
+        if self.media_path is None or not self.audio_tracks:
+            return
+        try:
+            clock = create_audio_clock(
+                self.media_path, find_binary("ffmpeg"), max(0, self.audio_box.currentIndex()))
+            if clock is not None and clock.start(seconds):
+                self._audio_clock = clock
+                return
+        except Exception:
+            self._audio_clock = None
+        ffplay = find_binary("ffplay")
+        if ffplay:
+            command = [ffplay, "-hide_banner", "-loglevel", "error", "-autoexit",
+                       "-nodisp", "-vn", "-ast", f"a:{max(0, self.audio_box.currentIndex())}",
+                       "-ss", str(seconds), "-i", str(self.media_path)]
+            self._audio_process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def _stop_audio(self):
+        if self._audio_clock is not None:
             try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            kind = event[0]
-            if kind == "status":
-                self.status_var.set(event[1])
-                continue
-            if kind == "log":
-                self._append_log(event[1])
-                continue
-            if kind == "progress":
-                self._on_translate_progress(event[1], event[2])
-                continue
-            if kind == "plan_file":
-                self._on_plan_file(event[1], event[2], event[3])
-                continue
-            if kind == "plan_step":
-                self._on_plan_step(event[1], event[2], event[3])
-                continue
-            if kind == "plan_progress":
-                self._on_plan_progress(event[1], event[2])
-                continue
-            if kind == "plan_result":
-                self._on_plan_result(event[1], event[2])
-                continue
-            if kind == "plan_error":
-                self._on_plan_error(event[1], event[2], event[3])
-                continue
-            if kind == "plan_skip":
-                self._on_plan_skip(event[1], event[2], event[3])
-                continue
-            if kind == "plan_summary":
-                self._on_plan_summary(event[1])
-                continue
-            if kind == "plan_done":
-                self._on_plan_done(event[1])
-                continue
-            if kind == "pending_done":
-                self._on_pending_mux_done(event[1], event[2])
-                continue
-            self._set_busy(False)
-            if kind == "error":
-                self._set_translate_running(False)
-                self._update_translate_hint()
-                message = str(event[1]) or "未知错误"
-                self._append_log(f"错误：{message}")
-                if len(event) > 2 and event[2]:
-                    tail = "\n".join(str(event[2]).strip().splitlines()[-6:])
-                    self._append_log(tail)
-                self.status_var.set("操作失败")
-                messagebox.showerror("处理失败", message)
-                continue
-            _, name, result = event
-            self.status_var.set("就绪")
-            self._handle_result(name, result)
-        self._poll_after = self.root.after(80, self._poll_events)
+                self._audio_clock.stop()
+            except Exception:
+                pass
+            self._audio_clock = None
+        if self._audio_process is not None:
+            process, self._audio_process = self._audio_process, None
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    def _audio_changed(self, _index):
+        if self._frame_timer.isActive():
+            self._play_started = self._play_position
+            self._play_anchor = time.perf_counter()
+            self._start_audio(self._play_position)
+
+    def _refresh_preview_frame(self, *_args):
+        self._caption_cache.clear()
+        if self._video is not None and not self._frame_timer.isActive():
+            self._seek_pending = True
+            self._render_frame()
+
+    def pause_playback(self):
+        self._frame_timer.stop()
+        self._stop_audio()
+        self.play_button.setText("播放")
+
+    def seek_video(self, value):
+        if self._video_duration <= 0:
+            return
+        self._play_position = self._video_duration * int(value) / 10000
+        self._seek_pending = True
+        if self._frame_timer.isActive():
+            self._play_started = self._play_position
+            self._play_anchor = time.perf_counter()
+            if self._audio_clock is not None and getattr(self._audio_clock, "supports_seek", False):
+                self._audio_clock.seek(self._play_position)
+            else:
+                self._start_audio(self._play_position)
+        self._render_frame()
+
+    def _close_video(self):
+        self.pause_playback()
+        if self._video is not None:
+            self._video.release()
+            self._video = None
+        self._video_duration = 0
+        self.preview.clear()
+        self.preview.setText("拖入媒体后预览画面")
+
+    def closeEvent(self, event):
+        if self.plan_cancel:
+            self.plan_cancel.set()
+        if self.translate_cancel:
+            self.translate_cancel.set()
+        self._close_video()
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_video") and self._video is not None:
+            self._refresh_preview_frame()
 
     def run(self):
-        self.root.mainloop()
+        self.show()
+        return self._app.exec()
 
 
 def cli_inspect(args) -> int:
@@ -7614,9 +5727,9 @@ def make_parser() -> argparse.ArgumentParser:
     mux_parser.add_argument("--container", default="auto",
                              help="auto 默认 MKV/MKA，也可指定 mkv/mka/mp4/mov/webm")
     mux_parser.add_argument("--language", action="append", metavar="LANG",
-                             help="每条字幕的语言标记（可重复，按顺序对应；缺省从文件名推断）")
+                            help="每条字幕的语言标记（可重复，按顺序对应；缺省从文件名推断）")
     mux_parser.add_argument("--drop-subtitle", type=int, action="append", metavar="N",
-                             help="压制时删除的内嵌字幕序号（0 起，按字幕流顺序，可重复指定）")
+                            help="压制时删除的内嵌字幕序号（0 起，按字幕流顺序，可重复指定）")
     mux_parser.set_defaults(handler=cli_mux)
     return parser
 
@@ -7627,7 +5740,7 @@ def main(argv: list[str] | None = None) -> int:
         relaunched = relaunch_in_venv(list(sys.argv[1:]))
         if relaunched is not None:
             return relaunched
-    enable_dpi_awareness()          # 必须在创建 Tk 窗口之前调用
+    enable_dpi_awareness()          # 必须在创建 Qt 窗口之前调用
     args_list = list(sys.argv[1:] if argv is None else argv)
     if not args_list or (len(args_list) == 1 and Path(args_list[0]).suffix.lower() in MEDIA_EXTENSIONS):
         initial_path = args_list[0] if args_list else None
